@@ -34,6 +34,17 @@ GgufModel _model(String id, {ChatTemplate t = ChatTemplate.chatml, String? path 
   sizeBytes: 1,
 );
 
+/// ensureLoaded her çağrıda hata veren sahte motor.
+class _FailingLoadEngine extends FakeEngine {
+  _FailingLoadEngine() : super(ctx: 4096);
+
+  @override
+  Future<void> ensureLoaded(String path, {int? expectedBytes}) async {
+    loadCalls++;
+    throw StateError('disk okunamadı');
+  }
+}
+
 Uint8List _zip(Map<String, String> files) {
   final a = Archive();
   files.forEach((k, v) {
@@ -59,6 +70,8 @@ void main() {
     bool workflowBusy = false,
     List<ChatMessage> seed = const [],
     List<GgufModel>? models,
+    bool autoPrepare = true,
+    bool awaitLoaded = true,
   }) async {
     dir = Directory.systemTemp.createTempSync('kripton_chatc_');
     final store = ChatStore(root: dir);
@@ -74,9 +87,11 @@ void main() {
         chatModelsLoadedProvider.overrideWithValue(true),
         workflowBusyProvider.overrideWithValue(workflowBusy),
         chatDefaultModelIdProvider.overrideWithValue('m1'),
+        settingsProvider.overrideWith(() => SettingsController(AppSettings(chatAutoPrepare: autoPrepare))),
       ],
     );
     final c = container.read(chatProvider.notifier);
+    if (!awaitLoaded) return c;
     for (var i = 0; i < 200 && !container.read(chatProvider).loaded; i++) {
       await Future<void>.delayed(const Duration(milliseconds: 10));
     }
@@ -279,5 +294,130 @@ void main() {
     addTearDown(c.dispose);
     c.read(settingsProvider.notifier).setStartScreen(StartScreen.dev);
     expect(c.read(settingsProvider).startScreen, StartScreen.dev);
+  });
+
+  group('açılışta model hazırlığı', () {
+    final two = [_model('m1', path: '/tmp/m1.gguf'), _model('m2', path: '/tmp/m2.gguf')];
+
+    test('prepare() modeli yükler; preparing true -> false', () async {
+      final gate = Completer<void>();
+      final c = await boot(e: FakeEngine(ctx: 4096, loadGate: gate), models: two);
+      final fut = c.prepare();
+      await waitFor(() => engine.loadCalls == 1);
+      var s = container.read(chatProvider);
+      expect(s.preparing, isTrue);
+      expect(s.phase, 'Model hazırlanıyor…');
+      expect(container.read(chatBusyProvider), isFalse);
+      gate.complete();
+      await fut;
+      s = container.read(chatProvider);
+      expect(s.preparing, isFalse);
+      expect(s.phase, '');
+      expect(s.error, isNull);
+      expect(engine.loadedPath, '/tmp/m1.gguf');
+      expect(engine.generateCalls, 0);
+    });
+
+    test('preparing iken send() ve retry() sessizce döner', () async {
+      final gate = Completer<void>();
+      final c = await boot(
+        e: FakeEngine(ctx: 4096, loadGate: gate),
+        models: two,
+        seed: [seedMsg('u1', ChatRole.user, 'bekleyen soru', 1000)],
+      );
+      final fut = c.prepare();
+      await waitFor(() => container.read(chatProvider).preparing);
+      await c.send('Merhaba');
+      await c.retry();
+      var s = container.read(chatProvider);
+      expect(s.messages.map((m) => m.text), ['bekleyen soru']);
+      expect(s.notice, isNull);
+      expect(engine.generateCalls, 0);
+      gate.complete();
+      await fut;
+      expect(container.read(chatProvider).preparing, isFalse);
+      // Hazırlık bitince gönderim normal çalışır.
+      await c.send('Merhaba');
+      s = container.read(chatProvider);
+      expect(s.messages.last.role, ChatRole.assistant);
+      expect(engine.generateCalls, 1);
+    });
+
+    test('hazırlanırken model değişirse yeni model de yüklenir', () async {
+      final gate = Completer<void>();
+      final c = await boot(e: FakeEngine(ctx: 4096, loadGate: gate), models: two);
+      final fut = c.prepare();
+      await waitFor(() => engine.loadCalls == 1);
+      container.read(settingsProvider.notifier).setChatModel('m2');
+      gate.complete();
+      await fut;
+      expect(engine.loadCalls, 2);
+      expect(engine.loadedPath, '/tmp/m2.gguf');
+      expect(container.read(chatProvider).preparing, isFalse);
+    });
+
+    test('AI akışı çalışırken prepare() yüklemez (manuel de)', () async {
+      final c = await boot(workflowBusy: true, models: two);
+      await c.prepare();
+      await c.prepare(manual: true);
+      expect(engine.loadCalls, 0);
+      expect(container.read(chatProvider).preparing, isFalse);
+      expect(container.read(chatProvider).error, isNull);
+    });
+
+    test('ensureLoaded hata verirse preparing false, error dolu; yeniden hazırlama hatayı temizler', () async {
+      final c = await boot(e: _FailingLoadEngine(), models: two);
+      await c.prepare();
+      var s = container.read(chatProvider);
+      expect(s.preparing, isFalse);
+      expect(s.phase, '');
+      expect(s.error, contains('Model hazırlanamadı'));
+      expect(s.error, contains('disk okunamadı'));
+      expect(engine.loadCalls, 1);
+      await c.prepare(manual: true);
+      s = container.read(chatProvider);
+      expect(engine.loadCalls, 2);
+      expect(s.preparing, isFalse);
+      expect(s.error, contains('Model hazırlanamadı'));
+    });
+
+    test('ayar kapalıyken prepare() yüklemez; manual: true yükler', () async {
+      final c = await boot(autoPrepare: false, models: two);
+      await c.prepare();
+      expect(engine.loadCalls, 0);
+      expect(engine.loadedPath, isNull);
+      await c.prepare(manual: true);
+      expect(engine.loadCalls, 1);
+      expect(engine.loadedPath, '/tmp/m1.gguf');
+    });
+
+    test('sohbet yüklenmeden çağrılan prepare(), yükleme bitince çalışır', () async {
+      final c = await boot(models: two, awaitLoaded: false);
+      expect(container.read(chatProvider).loaded, isFalse);
+      await c.prepare();
+      expect(engine.loadCalls, 0);
+      await waitFor(() => engine.loadCalls == 1);
+      await waitFor(() => !container.read(chatProvider).preparing && container.read(chatProvider).loaded);
+      expect(engine.loadedPath, '/tmp/m1.gguf');
+    });
+
+    test('indirilmiş model yoksa prepare() hiçbir şey yapmaz', () async {
+      final c = await boot(models: [_model('m1', path: null)]);
+      await c.prepare(manual: true);
+      expect(engine.loadCalls, 0);
+      expect(container.read(chatProvider).preparing, isFalse);
+      expect(container.read(chatProvider).error, isNull);
+    });
+
+    test('ayar varsayılan AÇIK, kalıcı JSON\'a yazılır ve geri okunur', () {
+      expect(const AppSettings().chatAutoPrepare, isTrue);
+      expect(AppSettings.fromJson({}).chatAutoPrepare, isTrue);
+      final off = AppSettings.fromJson(const AppSettings(chatAutoPrepare: false).toJson());
+      expect(off.chatAutoPrepare, isFalse);
+      final c = ProviderContainer();
+      addTearDown(c.dispose);
+      c.read(settingsProvider.notifier).setChatAutoPrepare(false);
+      expect(c.read(settingsProvider).chatAutoPrepare, isFalse);
+    });
   });
 }

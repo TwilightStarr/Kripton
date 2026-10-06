@@ -20,11 +20,16 @@ class AppSettings {
   /// Sohbet modunda seçilen model ([GgufModel.id]); null = cihaz varsayılanı.
   final String? chatModelId;
 
+  /// Açıksa sohbet açılınca model ilk mesajı beklemeden arka planda hazırlanır.
+  /// Düşük RAM'li telefonlarda kapatılabilir (model ilk mesajda yüklenir).
+  final bool chatAutoPrepare;
+
   const AppSettings({
     this.themeId = 'gece',
     this.liteOnStart = false,
     this.startScreen = StartScreen.flow,
     this.chatModelId,
+    this.chatAutoPrepare = true,
   });
 
   AppSettings copyWith({
@@ -32,11 +37,13 @@ class AppSettings {
     bool? liteOnStart,
     StartScreen? startScreen,
     String? chatModelId,
+    bool? chatAutoPrepare,
   }) => AppSettings(
         themeId: themeId ?? this.themeId,
         liteOnStart: liteOnStart ?? this.liteOnStart,
         startScreen: startScreen ?? this.startScreen,
         chatModelId: chatModelId ?? this.chatModelId,
+        chatAutoPrepare: chatAutoPrepare ?? this.chatAutoPrepare,
       );
 
   Map<String, dynamic> toJson() => {
@@ -44,6 +51,7 @@ class AppSettings {
         'liteOnStart': liteOnStart,
         'startScreen': startScreen.name,
         if (chatModelId != null) 'chatModel': chatModelId,
+        'chatAutoPrepare': chatAutoPrepare,
       };
 
   factory AppSettings.fromJson(Map<String, dynamic> j) => AppSettings(
@@ -51,6 +59,7 @@ class AppSettings {
         liteOnStart: j['liteOnStart'] == true,
         startScreen: startScreenFromId(j['startScreen']),
         chatModelId: j['chatModel'] is String ? j['chatModel'] as String : null,
+        chatAutoPrepare: j['chatAutoPrepare'] != false,
       );
 
   /// Açılışta (runApp'ten önce) okunur; hata olursa varsayılanlar döner.
@@ -102,6 +111,12 @@ class SettingsController extends Notifier<AppSettings> {
   void setChatModel(String id) {
     if (state.chatModelId == id) return;
     state = state.copyWith(chatModelId: id);
+    _save();
+  }
+
+  void setChatAutoPrepare(bool v) {
+    if (state.chatAutoPrepare == v) return;
+    state = state.copyWith(chatAutoPrepare: v);
     _save();
   }
 

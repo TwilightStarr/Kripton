@@ -3,7 +3,9 @@ import 'package:flutter/services.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:open_filex/open_filex.dart';
 
+import '../application/app_controller.dart' show engineProvider;
 import '../application/chat_controller.dart';
+import '../application/settings_controller.dart';
 import '../core/theme.dart';
 import '../domain/chat_models.dart';
 import '../domain/entities.dart';
@@ -31,6 +33,14 @@ class _ChatPageState extends ConsumerState<ChatPage> {
   final _focus = FocusNode();
 
   @override
+  void initState() {
+    super.initState();
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (mounted) ref.read(chatProvider.notifier).prepare();
+    });
+  }
+
+  @override
   void dispose() {
     _input.dispose();
     _focus.dispose();
@@ -47,7 +57,7 @@ class _ChatPageState extends ConsumerState<ChatPage> {
     final text = _input.text.trim();
     if (text.isEmpty) return;
     final s = ref.read(chatProvider);
-    if (s.generating || !s.loaded) return;
+    if (s.generating || s.preparing || !s.loaded) return;
     if (ref.read(workflowBusyProvider)) {
       _snack('Bir AI akışı çalışıyor; bitince sohbete dönebilirsin.');
       return;
@@ -89,7 +99,18 @@ class _ChatPageState extends ConsumerState<ChatPage> {
     final model = ref.watch(chatModelProvider);
     final modelsLoaded = ref.watch(chatModelsLoadedProvider);
     final wfBusy = ref.watch(workflowBusyProvider);
+    final autoPrepare = ref.watch(settingsProvider.select((x) => x.chatAutoPrepare));
+    final engineReady = model != null && model.localPath != null && ref.read(engineProvider).loadedPath == model.localPath;
 
+    ref.listen<String?>(chatModelProvider.select((m) => m?.id), (prev, next) {
+      if (next != null && prev != next) c.prepare();
+    });
+    ref.listen<bool>(workflowBusyProvider, (prev, next) {
+      if (prev == true && !next) c.prepare();
+    });
+    ref.listen<bool>(chatProvider.select((x) => x.loaded), (prev, next) {
+      if (prev == false && next) c.prepare();
+    });
     ref.listen<int>(chatProvider.select((x) => x.noticeId), (_, __) {
       final m = ref.read(chatProvider).notice;
       if (m != null) _snack(m);
@@ -101,6 +122,14 @@ class _ChatPageState extends ConsumerState<ChatPage> {
     final chunks = s.sources.fold<int>(0, (a, x) => a + x.chunks.length);
     final lastIsUser = msgs.isNotEmpty && msgs.last.role == ChatRole.user;
     final canRetry = !live && s.error != null && lastIsUser;
+    final prepFailed = !live && !s.preparing && s.error != null && !lastIsUser;
+    final showPrepareButton = !autoPrepare &&
+        s.loaded &&
+        !s.preparing &&
+        !live &&
+        !wfBusy &&
+        model != null &&
+        !engineReady;
 
     return Scaffold(
       appBar: AppBar(
@@ -153,16 +182,34 @@ class _ChatPageState extends ConsumerState<ChatPage> {
                   _goFlow();
                 case 'dev':
                   await Navigator.of(context).push(DevModePage.route());
+                case 'autoPrepare':
+                  ref.read(settingsProvider.notifier).setChatAutoPrepare(!autoPrepare);
+                  if (!autoPrepare) c.prepare();
               }
             },
-            itemBuilder: (_) => const [
-              PopupMenuItem(value: 'model', child: Text('Model seç')),
-              PopupMenuItem(value: 'models', child: Text('Model yöneticisi')),
-              PopupMenuItem(value: 'look', child: Text('Görünüm ve açılış ekranı')),
-              PopupMenuItem(value: 'export', child: Text('Geçmişi dışa aktar')),
-              PopupMenuDivider(),
-              PopupMenuItem(value: 'flow', child: Text('AI Akışı moduna geç')),
-              PopupMenuItem(value: 'dev', child: Text('Geliştirme Moduna geç')),
+            itemBuilder: (_) => [
+              const PopupMenuItem(value: 'model', child: Text('Model seç')),
+              const PopupMenuItem(value: 'models', child: Text('Model yöneticisi')),
+              const PopupMenuItem(value: 'look', child: Text('Görünüm ve açılış ekranı')),
+              CheckedPopupMenuItem(
+                value: 'autoPrepare',
+                checked: autoPrepare,
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    const Text('Açılınca modeli otomatik hazırla'),
+                    Text(
+                      'Düşük RAM\'li telefonda kapalı tut.',
+                      style: TextStyle(fontSize: 11.5, color: KColors.muted),
+                    ),
+                  ],
+                ),
+              ),
+              const PopupMenuItem(value: 'export', child: Text('Geçmişi dışa aktar')),
+              const PopupMenuDivider(),
+              const PopupMenuItem(value: 'flow', child: Text('AI Akışı moduna geç')),
+              const PopupMenuItem(value: 'dev', child: Text('Geliştirme Moduna geç')),
             ],
           ),
           const SizedBox(width: 4),
@@ -170,6 +217,29 @@ class _ChatPageState extends ConsumerState<ChatPage> {
       ),
       body: Column(
         children: [
+          if (s.preparing)
+            Column(
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              children: [
+                LinearProgressIndicator(minHeight: 2, color: KColors.accent, backgroundColor: KColors.border),
+                Padding(
+                  padding: const EdgeInsets.fromLTRB(16, 4, 16, 2),
+                  child: Text('Model hazırlanıyor…', style: TextStyle(fontSize: 11.5, color: KColors.muted)),
+                ),
+              ],
+            )
+          else if (showPrepareButton)
+            Align(
+              alignment: Alignment.centerLeft,
+              child: Padding(
+                padding: const EdgeInsets.only(left: 8),
+                child: TextButton.icon(
+                  onPressed: () => c.prepare(manual: true),
+                  icon: const Icon(Icons.power_settings_new, size: 18),
+                  label: const Text('Modeli hazırla'),
+                ),
+              ),
+            ),
           if (s.loaded)
             Padding(
               padding: const EdgeInsets.fromLTRB(16, 2, 16, 6),
@@ -239,14 +309,19 @@ class _ChatPageState extends ConsumerState<ChatPage> {
               color: KColors.red,
               icon: Icons.error_outline,
               text: s.error!,
-              action: canRetry ? 'Tekrar dene' : null,
-              onAction: canRetry ? c.retry : null,
+              action: canRetry
+                  ? 'Tekrar dene'
+                  : (prepFailed ? 'Modeli yeniden hazırla' : null),
+              onAction: canRetry
+                  ? (s.preparing ? null : c.retry)
+                  : (prepFailed ? () => c.prepare(manual: true) : null),
               onClose: c.clearError,
             ),
           _InputBar(
             controller: _input,
             focus: _focus,
             generating: live,
+            preparing: s.preparing,
             enabled: s.loaded,
             onSend: _send,
             onStop: c.stop,
@@ -481,7 +556,7 @@ class _Banner extends StatelessWidget {
           Icon(icon, size: 18, color: color),
           const SizedBox(width: 10),
           Expanded(child: Text(text, style: TextStyle(fontSize: 12.5, height: 1.35, color: KColors.text))),
-          if (action != null && onAction != null) TextButton(onPressed: onAction, child: Text(action!)),
+          if (action != null) TextButton(onPressed: onAction, child: Text(action!)),
           if (onClose != null)
             IconButton(
               visualDensity: VisualDensity.compact,
@@ -499,6 +574,7 @@ class _InputBar extends StatelessWidget {
     required this.controller,
     required this.focus,
     required this.generating,
+    required this.preparing,
     required this.enabled,
     required this.onSend,
     required this.onStop,
@@ -507,6 +583,7 @@ class _InputBar extends StatelessWidget {
   final TextEditingController controller;
   final FocusNode focus;
   final bool generating;
+  final bool preparing;
   final bool enabled;
   final VoidCallback onSend;
   final VoidCallback onStop;
@@ -530,7 +607,7 @@ class _InputBar extends StatelessWidget {
                 keyboardType: TextInputType.multiline,
                 textCapitalization: TextCapitalization.sentences,
                 style: const TextStyle(fontSize: 14.5),
-                decoration: const InputDecoration(hintText: 'Bir şey yaz veya sor…'),
+                decoration: InputDecoration(hintText: preparing ? 'Model hazırlanıyor…' : 'Bir şey yaz veya sor…'),
               ),
             ),
             const SizedBox(width: 8),
@@ -542,9 +619,15 @@ class _InputBar extends StatelessWidget {
                     icon: const Icon(Icons.stop_rounded),
                   )
                 : IconButton.filled(
-                    tooltip: 'Gönder',
-                    onPressed: enabled ? onSend : null,
-                    icon: const Icon(Icons.arrow_upward_rounded),
+                    tooltip: preparing ? 'Model hazırlanıyor…' : 'Gönder',
+                    onPressed: enabled && !preparing ? onSend : null,
+                    icon: preparing
+                        ? SizedBox(
+                            width: 18,
+                            height: 18,
+                            child: CircularProgressIndicator(strokeWidth: 2, color: KColors.muted),
+                          )
+                        : const Icon(Icons.arrow_upward_rounded),
                   ),
           ],
         ),

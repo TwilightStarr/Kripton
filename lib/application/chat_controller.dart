@@ -9,6 +9,7 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:wakelock_plus/wakelock_plus.dart';
 
 import '../data/chat_store.dart';
+import '../data/crash_guard.dart';
 import '../data/llm_engine.dart';
 import '../data/profile_zip.dart';
 import '../domain/chat_models.dart';
@@ -86,6 +87,7 @@ class ChatState {
     this.sources = const [],
     this.pins = const [],
     this.generating = false,
+    this.preparing = false,
     this.phase = '',
     this.draft = '',
     this.error,
@@ -105,6 +107,9 @@ class ChatState {
   final List<ProfileSource> sources;
   final List<PinnedNote> pins;
   final bool generating;
+
+  /// Model sohbet açılınca (ilk mesajdan önce) arka planda yükleniyor.
+  final bool preparing;
 
   /// "Model hazırlanıyor…", "Yazıyor…" gibi anlık durum.
   final String phase;
@@ -128,6 +133,7 @@ class ChatState {
     List<ProfileSource>? sources,
     List<PinnedNote>? pins,
     bool? generating,
+    bool? preparing,
     String? phase,
     String? draft,
     String? error,
@@ -143,6 +149,7 @@ class ChatState {
     sources: sources ?? this.sources,
     pins: pins ?? this.pins,
     generating: generating ?? this.generating,
+    preparing: preparing ?? this.preparing,
     phase: phase ?? this.phase,
     draft: draft ?? this.draft,
     error: clearError ? null : (error ?? this.error),
@@ -160,12 +167,19 @@ class ChatController extends Notifier<ChatState> {
   int _shown = kChatPageSize;
   int _seq = 0;
   bool _cancelled = false;
+  bool _disposed = false;
+  bool _prepareAfterInit = false;
+  bool _prepareManualAfterInit = false;
+  bool _prepareError = false;
   Completer<void>? _cancelSignal;
   DateTime _lastUi = DateTime.fromMillisecondsSinceEpoch(0);
 
   @override
   ChatState build() {
-    ref.onDispose(() => _cancelled = true);
+    ref.onDispose(() {
+      _cancelled = true;
+      _disposed = true;
+    });
     Future.microtask(_init);
     return const ChatState();
   }
@@ -194,6 +208,12 @@ class ChatController extends Notifier<ChatState> {
       sources: mem.sources,
       pins: mem.pins,
     );
+    if (_prepareAfterInit) {
+      final manual = _prepareManualAfterInit;
+      _prepareAfterInit = false;
+      _prepareManualAfterInit = false;
+      unawaited(prepare(manual: manual));
+    }
   }
 
   // ───────────────────────── yardımcılar ─────────────────────────
@@ -274,7 +294,7 @@ class ChatController extends Notifier<ChatState> {
   /// Kullanıcı mesajını (hemen kalıcı olarak) kaydeder ve yanıt üretir.
   Future<void> send(String raw) async {
     final text = raw.trim();
-    if (text.isEmpty || state.generating || !state.loaded) return;
+    if (text.isEmpty || state.generating || state.preparing || !state.loaded) return;
     if (ref.read(workflowBusyProvider)) {
       _notice('Bir AI akışı çalışıyor; bitince sohbete dönebilirsin.');
       return;
@@ -296,7 +316,7 @@ class ChatController extends Notifier<ChatState> {
 
   /// Son mesaj kullanıcınınsa (yanıt üretilemediyse) yanıtı yeniden dener; mesaj tekrar eklenmez.
   Future<void> retry() async {
-    if (state.generating || !state.loaded || _all.isEmpty) return;
+    if (state.generating || state.preparing || !state.loaded || _all.isEmpty) return;
     final last = _all.last;
     if (last.role != ChatRole.user) return;
     if (ref.read(workflowBusyProvider)) {
@@ -309,6 +329,61 @@ class ChatController extends Notifier<ChatState> {
       return;
     }
     await _reply(model, last);
+  }
+
+  /// Sohbet modelini ilk mesajı beklemeden yükler (ayar: [AppSettings.chatAutoPrepare]).
+  ///
+  /// Sessizce çıkar: üretim/hazırlık sürüyorsa, AI akışı motoru kullanıyorsa, indirilmiş model yoksa
+  /// veya ayar kapalıysa ([manual] değilse). [chatBusyProvider] bilerek açılmaz: motor kapısı
+  /// (_gate) yükleme ile diğer işleri zaten sıraya koyar.
+  Future<void> prepare({bool manual = false}) async {
+    if (_disposed || state.generating || state.preparing) return;
+    if (!manual && !ref.read(settingsProvider).chatAutoPrepare) return;
+    if (!state.loaded) {
+      _prepareAfterInit = true;
+      _prepareManualAfterInit = _prepareManualAfterInit || manual;
+      return;
+    }
+    if (ref.read(workflowBusyProvider)) return;
+    final first = ref.read(chatModelProvider);
+    if (first == null || first.localPath == null) return;
+
+    final engine = ref.read(engineProvider);
+    final sw = Stopwatch()..start();
+    String? lastId = first.id;
+    var failed = false;
+    state = state.copyWith(
+      preparing: true,
+      phase: 'Model hazırlanıyor…',
+      clearError: manual || _prepareError,
+    );
+    _prepareError = false;
+    try {
+      // Hazırlanırken başka model seçilirse yenisi de yüklenir (en çok 4 tur).
+      for (var round = 0; round < 4; round++) {
+        if (_disposed || ref.read(workflowBusyProvider)) return;
+        final m = ref.read(chatModelProvider);
+        if (m == null || m.localPath == null) return;
+        lastId = m.id;
+        await engine.ensureLoaded(m.localPath!, expectedBytes: m.sizeBytes);
+        await engine.waitNativeIdle(const Duration(seconds: 8));
+        if (_disposed) return;
+        if (ref.read(chatModelProvider)?.id == m.id) break;
+      }
+    } catch (e) {
+      failed = true;
+      if (!_disposed) {
+        _prepareError = true;
+        state = state.copyWith(error: 'Model hazırlanamadı: ${_errText(e)}');
+      }
+    } finally {
+      CrashGuard.log(
+        'Sohbet ön hazırlık',
+        '${sw.elapsedMilliseconds}ms model=$lastId${failed ? ' (hata)' : ''}',
+        null,
+      );
+      if (!_disposed) state = state.copyWith(preparing: false, phase: '');
+    }
   }
 
   Future<void> stop() async {
@@ -339,7 +414,14 @@ class ChatController extends Notifier<ChatState> {
     final signal = Completer<void>();
     _cancelSignal = signal;
     ref.read(chatBusyProvider.notifier).state = true;
-    state = state.copyWith(generating: true, phase: 'Model hazırlanıyor…', draft: '', clearError: true);
+    final alreadyLoaded = engine.loadedPath == m.localPath;
+    state = state.copyWith(
+      generating: true,
+      phase: alreadyLoaded ? 'Hafıza taranıyor…' : 'Model hazırlanıyor…',
+      draft: '',
+      clearError: true,
+    );
+    _prepareError = false;
     try {
       await WakelockPlus.enable();
     } catch (_) {}
