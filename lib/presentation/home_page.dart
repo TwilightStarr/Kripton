@@ -424,7 +424,7 @@ class _InfoPanel extends StatelessWidget {
       ),
       child: Column(
         children: [
-          _infoRow('GPU Backend', 'Vulkan → OpenCL', KColors.accent),
+          _infoRow('Hesaplama', 'CPU (GPU kapalı)', KColors.accent),
           _infoRow('Bellek Haritalama', 'mmap', KColors.green),
           _infoRow('Ekran Kilidi', 'WakelockPlus', KColors.accent),
           _infoRow('Isı İpucu', 'Uzun akışları şarjdayken çalıştır', KColors.amber),
