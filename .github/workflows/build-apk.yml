@@ -1,0 +1,557 @@
+name: Build APK & Publish Release
+
+on:
+  push:
+    branches: [main, master]
+    tags: ['v*']
+    paths-ignore: ['**.md']
+  workflow_dispatch:
+
+permissions:
+  contents: write   # Release oluşturmak için gerekli
+
+concurrency:
+  group: build-apk-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  FLUTTER_SUPPRESS_ANALYTICS: 'true'
+  # flutter_llama pub paketi llama.cpp kaynağını içermiyor (git submodule); build sırasında buradaki sürüm çekilir
+  LLAMA_CPP_TAG: 'b6900'
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      - name: Disk alanı aç
+        shell: bash
+        run: |
+          df -h /
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/share/boost \
+            /usr/local/lib/node_modules /opt/hostedtoolcache/CodeQL \
+            /usr/local/.ghcup /usr/share/swift || true
+          sudo docker image prune --all --force || true
+          sudo apt-get clean || true
+          df -h /
+
+      - name: Kodu çek
+        uses: actions/checkout@v4
+
+      - name: Kendi kaynak paketini hazırla (Kripton kendini geliştirebilsin)
+        shell: bash
+        run: bash tool/pack_self_source.sh
+
+      - name: Sürüm ve etiket bilgisini hazırla
+        shell: bash
+        run: |
+          set -euo pipefail
+          VER_FULL=$(grep -E '^version:' pubspec.yaml | head -1 | awk '{print $2}' | tr -d '\r')
+          VER_NAME="${VER_FULL%%+*}"
+          if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+            TAG="${GITHUB_REF_NAME}"
+          else
+            TAG="v${VER_NAME}-build.${GITHUB_RUN_NUMBER}"
+          fi
+          echo "VER_NAME=${VER_NAME}" >> "$GITHUB_ENV"
+          echo "TAG=${TAG}" >> "$GITHUB_ENV"
+          echo "Sürüm: ${VER_NAME}  Etiket: ${TAG}"
+
+      - name: Java 17 kur
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Flutter kur (stable)
+        id: flutter_primary
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+
+      - name: Android lisanslarını kabul et
+        shell: bash
+        run: |
+          yes | "${ANDROID_HOME:-$ANDROID_SDK_ROOT}/cmdline-tools/latest/bin/sdkmanager" --licenses >/dev/null 2>&1 || true
+
+      - name: Android SDK bileşenlerini kur (CMake, NDK 28.2, SDK 36)
+        shell: bash
+        run: |
+          SDKM="${ANDROID_HOME:-$ANDROID_SDK_ROOT}/cmdline-tools/latest/bin/sdkmanager"
+          yes | "$SDKM" "cmake;3.18.1" "cmake;3.22.1" "ndk;28.2.13676358" "platforms;android-36" "build-tools;35.0.0" || true
+          ls "${ANDROID_HOME:-$ANDROID_SDK_ROOT}/cmake" || true
+
+      - name: Yardımcı betikleri yaz
+        shell: bash
+        run: |
+          # ---------- android iskeletini üretir (kurulum.sh'in CI karşılığı) ----------
+          cat > "$RUNNER_TEMP/scaffold.sh" <<'EOF'
+          #!/usr/bin/env bash
+          set -euo pipefail
+          cd "$GITHUB_WORKSPACE"
+          ORIG="$RUNNER_TEMP/android_orig"
+
+          # Özgün android/ klasörünü ilk çağrıda yedekle
+          if [ ! -d "$ORIG" ]; then
+            if [ -d android ]; then cp -r android "$ORIG"; else mkdir -p "$ORIG"; fi
+          fi
+
+          # Depoda zaten tam bir Gradle projesi varsa dokunma
+          if [ -f "$ORIG/settings.gradle" ] || [ -f "$ORIG/settings.gradle.kts" ]; then
+            echo "android/ klasörü tam, iskelet üretilmiyor."
+            exit 0
+          fi
+
+          # Özgün hâle dön (yedek sürümde yeniden denemede temiz başlangıç)
+          rm -rf android
+          cp -r "$ORIG" android
+
+          TMP=$(mktemp -d)
+          flutter create --no-pub --org com.kripton --project-name kripton_ai --platforms android "$TMP/app"
+          cp -r "$TMP/app/android/." android/
+
+          # Kullanıcının kendi AndroidManifest.xml dosyasını geri koy
+          if [ -f "$ORIG/app/src/main/AndroidManifest.xml" ]; then
+            cp "$ORIG/app/src/main/AndroidManifest.xml" android/app/src/main/AndroidManifest.xml
+          fi
+
+          # Kripton ikonunu geri koy (flutter create varsayılan Flutter ikonunu yazar)
+          if [ -d "$ORIG/app/src/main/res" ]; then
+            cp -r "$ORIG/app/src/main/res/." android/app/src/main/res/
+          fi
+          # Uygulama adı "Kripton" (launcher'da görünen ad)
+          sed -i -E 's|android:label="[^"]*"|android:label="Kripton"|' android/app/src/main/AndroidManifest.xml
+
+          # applicationId = com.kripton.ai ve minSdk = 26
+          for f in android/app/build.gradle android/app/build.gradle.kts; do
+            [ -f "$f" ] || continue
+            sed -i -E 's/applicationId\s*=?\s*"[^"]*"/applicationId = "com.kripton.ai"/; s/minSdk(Version)?\s*=?\s*flutter\.minSdkVersion/minSdk = 26/; s/minSdk(Version)?\s*=?\s*[0-9]+/minSdk = 26/' "$f"
+            sed -i -E 's/^(\s*)compileSdk(Version)?\s*=?\s*.*/\1compileSdk = 36/' "$f"
+            if grep -qE '^\s*ndkVersion' "$f"; then
+              sed -i -E 's/^(\s*)ndkVersion\s*=?\s*.*/\1ndkVersion = "28.2.13676358"/' "$f"
+            fi
+            echo "--- $f"; grep -nE 'applicationId|minSdk|compileSdk|ndkVersion|namespace' "$f" || true
+          done
+
+          # extractNativeLibs manifest'te açıkça verilemez -> jniLibs.useLegacyPackaging (native .so'lar kurulumda çıkarılır)
+          sed -i -E 's/[[:space:]]*android:extractNativeLibs="[^"]*"//' android/app/src/main/AndroidManifest.xml
+          for f in android/app/build.gradle android/app/build.gradle.kts; do
+            [ -f "$f" ] || continue
+            if ! grep -q useLegacyPackaging "$f"; then
+              sed -i -E '0,/namespace\s*=/s//packaging { jniLibs { useLegacyPackaging = true } }\n    namespace =/' "$f"
+            fi
+            grep -n 'useLegacyPackaging' "$f" || true
+          done
+
+                    # ---------- ApplicationExitInfo kanalı + ön plan servisi (Kotlin) ----------
+                    MA=$(find android/app/src/main -name MainActivity.kt | head -1)
+                    if [ -z "$MA" ]; then
+                      echo "::warning::MainActivity.kt bulunamadı; çıkış nedeni ve ön plan servisi kanalları eklenmedi"
+                    else
+                      PKG=$(sed -n 's/^package //p' "$MA" | head -1 | tr -d '\r ')
+                      DIR=$(dirname "$MA")
+                      cat > "$DIR/MainActivity.kt" <<'KOTLIN'
+          package __PKG__
+
+          import android.app.ActivityManager
+          import android.app.ApplicationExitInfo
+          import android.content.ComponentCallbacks2
+          import android.os.Build
+          import android.os.Debug
+          import io.flutter.embedding.android.FlutterActivity
+          import io.flutter.embedding.engine.FlutterEngine
+          import io.flutter.plugin.common.EventChannel
+          import io.flutter.plugin.common.MethodChannel
+
+          class MainActivity : FlutterActivity() {
+              private var memoryEventSink: EventChannel.EventSink? = null
+              private val tombstoneKeep = Regex(
+                  "signal|Abort message|backtrace|#\\d{2} pc|libllama|libggml|fault addr|Cmdline|Build fingerprint|Process name|pid: |tid: |\\bpc [0-9a-f]"
+              )
+
+              override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
+                  super.configureFlutterEngine(flutterEngine)
+                  val messenger = flutterEngine.dartExecutor.binaryMessenger
+
+                  MethodChannel(messenger, "kripton/meminfo").setMethodCallHandler { call, result ->
+                      if (call.method == "getMemoryInfo") {
+                          result.success(memoryInfo())
+                      } else {
+                          result.notImplemented()
+                      }
+                  }
+
+                  EventChannel(messenger, "kripton/memory_pressure").setStreamHandler(
+                      object : EventChannel.StreamHandler {
+                          override fun onListen(arguments: Any?, events: EventChannel.EventSink?) {
+                              memoryEventSink = events
+                          }
+
+                          override fun onCancel(arguments: Any?) {
+                              memoryEventSink = null
+                          }
+                      }
+                  )
+
+                  MethodChannel(messenger, "kripton/exit_info").setMethodCallHandler { call, result ->
+                      if (call.method == "lastExit") {
+                          val since = call.argument<Number>("sinceMs")?.toLong() ?: 0L
+                          result.success(lastExit(since))
+                      } else {
+                          result.notImplemented()
+                      }
+                  }
+
+                  MethodChannel(messenger, "kripton/keepalive").setMethodCallHandler { call, result ->
+                      when (call.method) {
+                          "start" -> result.success(KriptonKeepAliveService.start(this))
+                          "stop" -> result.success(KriptonKeepAliveService.stop(this))
+                          else -> result.notImplemented()
+                      }
+                  }
+              }
+
+              override fun onTrimMemory(level: Int) {
+                  super.onTrimMemory(level)
+                  if (level >= ComponentCallbacks2.TRIM_MEMORY_RUNNING_CRITICAL) {
+                      runOnUiThread { memoryEventSink?.success(level) }
+                  }
+              }
+
+              private fun memoryInfo(): Map<String, Any> {
+                  val am = getSystemService(ACTIVITY_SERVICE) as ActivityManager
+                  val info = ActivityManager.MemoryInfo()
+                  am.getMemoryInfo(info)
+                  val appMemory = Debug.MemoryInfo()
+                  Debug.getMemoryInfo(appMemory)
+                  return mapOf(
+                      "totalMem" to info.totalMem,
+                      "availMem" to info.availMem,
+                      "threshold" to info.threshold,
+                      "lowMemory" to info.lowMemory,
+                      "appPssBytes" to appMemory.totalPss.toLong() * 1024L,
+                  )
+              }
+
+              // Son süreç çıkış kaydı (en yeni). Android 11 (API 30) öncesinde null.
+              private fun lastExit(sinceMs: Long): Map<String, Any?>? {
+                  if (Build.VERSION.SDK_INT < Build.VERSION_CODES.R) return null
+                  val am = getSystemService(ActivityManager::class.java) ?: return null
+                  val e = am.getHistoricalProcessExitReasons(packageName, 0, 4).firstOrNull() ?: return null
+                  if (e.timestamp <= sinceMs) return null
+                  val rawTrace = try {
+                      e.traceInputStream?.bufferedReader()?.use { it.readText() }
+                  } catch (t: Throwable) {
+                      null
+                  }
+                  val trace = rawTrace?.lineSequence()?.filter { tombstoneKeep.containsMatchIn(it) }?.take(400)
+                      ?.joinToString("\n")
+                  return mapOf(
+                      "reason" to e.reason,
+                      "reasonName" to reasonName(e.reason),
+                      "timestamp" to e.timestamp,
+                      "description" to e.description,
+                      "importance" to e.importance,
+                      "pssKb" to e.pss,
+                      "rssKb" to e.rss,
+                      "status" to e.status,
+                      "trace" to trace,
+                  )
+              }
+
+              private fun reasonName(r: Int): String = when (r) {
+                  ApplicationExitInfo.REASON_UNKNOWN -> "UNKNOWN"
+                  ApplicationExitInfo.REASON_EXIT_SELF -> "EXIT_SELF"
+                  ApplicationExitInfo.REASON_SIGNALED -> "SIGNALED"
+                  ApplicationExitInfo.REASON_LOW_MEMORY -> "LOW_MEMORY"
+                  ApplicationExitInfo.REASON_CRASH -> "CRASH"
+                  ApplicationExitInfo.REASON_CRASH_NATIVE -> "CRASH_NATIVE"
+                  ApplicationExitInfo.REASON_ANR -> "ANR"
+                  ApplicationExitInfo.REASON_USER_REQUESTED -> "USER_REQUESTED"
+                  ApplicationExitInfo.REASON_USER_STOPPED -> "USER_STOPPED"
+                  ApplicationExitInfo.REASON_DEPENDENCY_DIED -> "DEPENDENCY_DIED"
+                  ApplicationExitInfo.REASON_OTHER -> "OTHER"
+                  else -> "OTHER_$r"
+              }
+          }
+          KOTLIN
+                      cat > "$DIR/KriptonKeepAliveService.kt" <<'KOTLIN'
+          package __PKG__
+
+          import android.app.Notification
+          import android.app.NotificationChannel
+          import android.app.NotificationManager
+          import android.app.Service
+          import android.content.Context
+          import android.content.Intent
+          import android.content.pm.ServiceInfo
+          import android.os.Build
+          import android.os.IBinder
+
+          // Yerel LLM üretimi sırasında süreci ön planda tutan dataSync servisi.
+          // Üretim bitince (stop) kapanır. Başlatılamazsa (arka planda izin yok) yalnızca false döner.
+          class KriptonKeepAliveService : Service() {
+              override fun onBind(intent: Intent?): IBinder? = null
+
+              override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+                  val nm = getSystemService(NotificationManager::class.java)
+                  if (nm.getNotificationChannel(CHANNEL_ID) == null) {
+                      nm.createNotificationChannel(
+                          NotificationChannel(CHANNEL_ID, "Yapay zekâ üretimi", NotificationManager.IMPORTANCE_LOW)
+                      )
+                  }
+                  val notif = Notification.Builder(this, CHANNEL_ID)
+                      .setContentTitle("Kripton")
+                      .setContentText("Yerel model yanıt üretiyor")
+                      .setSmallIcon(android.R.drawable.stat_notify_sync)
+                      .setOngoing(true)
+                      .build()
+                  if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                      startForeground(NOTIF_ID, notif, ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC)
+                  } else {
+                      startForeground(NOTIF_ID, notif)
+                  }
+                  return START_NOT_STICKY
+              }
+
+              companion object {
+                  private const val CHANNEL_ID = "kripton_llm"
+                  private const val NOTIF_ID = 4107
+
+                  fun start(ctx: Context): Boolean = try {
+                      ctx.startForegroundService(Intent(ctx, KriptonKeepAliveService::class.java))
+                      true
+                  } catch (e: Exception) {
+                      false
+                  }
+
+                  fun stop(ctx: Context): Boolean = try {
+                      ctx.stopService(Intent(ctx, KriptonKeepAliveService::class.java))
+                      true
+                  } catch (e: Exception) {
+                      false
+                  }
+              }
+          }
+          KOTLIN
+                      sed -i "s/__PKG__/$PKG/" "$DIR/MainActivity.kt" "$DIR/KriptonKeepAliveService.kt"
+                      sed -i 's|</application>|        <service android:name=".KriptonKeepAliveService" android:exported="false" android:foregroundServiceType="dataSync"/>\n    </application>|' android/app/src/main/AndroidManifest.xml
+                      grep -q KriptonKeepAliveService android/app/src/main/AndroidManifest.xml && echo "servis manifest'e eklendi (pkg=$PKG)"
+                    fi
+
+          # Gradle belleği (native derleme için)
+          if [ -f android/gradle.properties ]; then
+            sed -i '/^org.gradle.jvmargs/d' android/gradle.properties
+          fi
+          echo 'org.gradle.jvmargs=-Xmx4G -XX:MaxMetaspaceSize=1G -XX:+HeapDumpOnOutOfMemoryError' >> android/gradle.properties
+          echo 'android.useAndroidX=true' >> android/gradle.properties
+          EOF
+
+          # ---------- derleme ----------
+          cat > "$RUNNER_TEMP/build.sh" <<'EOF'
+          #!/usr/bin/env bash
+          set -euo pipefail
+          cd "$GITHUB_WORKSPACE"
+          flutter --version
+          bash "$RUNNER_TEMP/scaffold.sh"
+          flutter pub get || { rm -f pubspec.lock; flutter pub upgrade; }
+
+          # flutter_llama, CMake'te <paket>/llama.cpp klasörünü bekliyor ama pub paketinde yok -> çek
+          PLUGIN=$(find "$HOME/.pub-cache/hosted/pub.dev" -maxdepth 1 -type d -name 'flutter_llama-*' | head -1)
+          echo "flutter_llama dizini: $PLUGIN"
+          # Uyumluluk sınaması: eklentinin cpp kaynağı, aday llama.cpp başlıklarıyla NDK clang -fsyntax-only derlenir.
+          llama_syntax_ok() {
+            local L="$PLUGIN/llama.cpp" f
+            local CXX="${ANDROID_HOME:-$ANDROID_SDK_ROOT}/ndk/28.2.13676358/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android26-clang++"
+            [ -x "$CXX" ] || return 0   # derleyici yoksa sınanamaz: engelleme
+            for f in "$PLUGIN"/android/src/main/cpp/*.cpp; do
+              [ -f "$f" ] || continue
+              "$CXX" -std=c++17 -fsyntax-only -w -I"$PLUGIN/android/src/main/cpp" -I"$L/include" \
+                -I"$L/ggml/include" -I"$L/common" -I"$L/vendor" -I"$L/src" "$f" 2>"$RUNNER_TEMP/syntax.err" \
+                || { head -5 "$RUNNER_TEMP/syntax.err"; return 1; }
+            done
+          }
+          if [ -n "$PLUGIN" ] && [ ! -f "$PLUGIN/llama.cpp/CMakeLists.txt" ]; then
+            rm -rf "$PLUGIN/llama.cpp" "$PLUGIN/android/.cxx"
+            PICKED=""
+            # LLAMA_CPP_TAG önce denenir; uyumsuzsa en yakın eski tag'e inilir ve o tag sabitlenir.
+            for T in "$LLAMA_CPP_TAG" b6500 b6000 b5500 b5000 b4500; do
+              rm -rf "$PLUGIN/llama.cpp"
+              git clone --depth 1 --branch "$T" https://github.com/ggml-org/llama.cpp "$PLUGIN/llama.cpp" >/dev/null 2>&1 || continue
+              if llama_syntax_ok; then PICKED="$T"; break; fi
+              echo "::warning::llama.cpp $T, flutter_llama cpp kaynağıyla uyumsuz; sıradaki tag deneniyor"
+            done
+            if [ -z "$PICKED" ]; then
+              echo "::warning::Uyumlu tag bulunamadı; $LLAMA_CPP_TAG ile devam ediliyor"
+              rm -rf "$PLUGIN/llama.cpp"
+              git clone --depth 1 --branch "$LLAMA_CPP_TAG" https://github.com/ggml-org/llama.cpp "$PLUGIN/llama.cpp" \
+                || git clone --depth 1 https://github.com/ggml-org/llama.cpp "$PLUGIN/llama.cpp"
+            fi
+            echo "llama.cpp tag: ${PICKED:-$LLAMA_CPP_TAG} commit: $(git -C "$PLUGIN/llama.cpp" rev-parse --short HEAD)"
+          fi
+          # R8 (release'te varsayılan açık): JNI/native sınıfları ve flutter_llama eklentisi silinmesin/yeniden adlandırılmasın
+          touch android/app/proguard-rules.pro
+          if ! grep -q 'kripton:flutter_llama' android/app/proguard-rules.pro; then
+            cat >> android/app/proguard-rules.pro <<'PRO'
+          # kripton:flutter_llama
+          -keep class **flutter_llama** { *; }
+          -keep class **FlutterLlama** { *; }
+          -keepclasseswithmembernames,includedescriptorclasses class * { native <methods>; }
+          -dontwarn **flutter_llama**
+          PRO
+          fi
+          # llama.cpp'nin Vulkan backend'i CMake >= 3.19 ister; AGP varsayılanı 3.18.1 -> 3.22.1 kullan
+          SDK="${ANDROID_HOME:-$ANDROID_SDK_ROOT}"
+          touch android/local.properties
+          sed -i '/^cmake.dir=/d' android/local.properties
+          echo "cmake.dir=$SDK/cmake/3.22.1" >> android/local.properties
+          for g in "$PLUGIN/android/build.gradle" "$PLUGIN/android/build.gradle.kts"; do
+            [ -f "$g" ] && sed -i 's/3\.18\.1/3.22.1/g' "$g" || true
+          done
+          ls "$SDK/cmake"
+
+          # Vulkan backend'i derlemek için vulkan.hpp başlığı gerekiyor (NDK'da yok) -> CPU (ARM NEON) ile derle
+          CML="$PLUGIN/android/src/main/cpp/CMakeLists.txt"
+          sed -i 's/find_library(vulkan-lib vulkan)/set(vulkan-lib "")/; s/find_library(opencl-lib OpenCL)/set(opencl-lib "")/' "$CML"
+          grep -nE 'vulkan-lib|opencl-lib' "$CML" | head -5
+          # llama.cpp Vulkan/OpenCL backend'lerini CMake seviyesinde kapat (plugin varsayılanı açsa bile CPU derlemesi kalsın)
+          { printf '%s\n' 'set(GGML_VULKAN OFF CACHE BOOL "" FORCE)' 'set(GGML_OPENCL OFF CACHE BOOL "" FORCE)'; cat "$CML"; } > "$CML.tmp" && mv "$CML.tmp" "$CML"
+          head -3 "$CML"
+          # ---- ARMv8.2 + dotprod/i8mm/fp16 hızlı derleme bayrakları (Dimensity 9300+: X4/A720) ----
+          # NOT: armv9-a tabanı derleyicide SVE2'yi açar (libggml-cpu.so'da ~9600 SVE komutu çıktı); bu yüzden armv8.2-a tabanı kullanılır.
+          # KRIPTON-FAST bloğu başarısızlıkta (derleme VEYA SIGILL denetimi) otomatik sökülüp güvenli derlemeye dönülür.
+          # SVE/SME/bf16 bilerek KAPALI (MediaTek çekirdeklerinde SVE sunulmuyor; SIGILL riski).
+          # GGML_OPENMP=OFF: ggml kendi iş parçacığı havuzunu kullanır (big.LITTLE'da libomp'tan daha öngörülebilir; libomp.so paketleme riski de yok).
+          FAST_BLOCK="$RUNNER_TEMP/fast_block.cmake"
+          cat > "$FAST_BLOCK" <<'FASTCMAKE'
+          # KRIPTON-FAST-BEGIN
+          set(GGML_NATIVE OFF CACHE BOOL "" FORCE)
+          set(GGML_CPU_ARM_ARCH "armv8.2-a+dotprod+i8mm+fp16" CACHE STRING "" FORCE)
+          set(GGML_LTO ON CACHE BOOL "" FORCE)
+          set(GGML_OPENMP OFF CACHE BOOL "" FORCE)
+          set(CMAKE_C_FLAGS_RELEASE "-O3 -DNDEBUG" CACHE STRING "" FORCE)
+          set(CMAKE_CXX_FLAGS_RELEASE "-O3 -DNDEBUG" CACHE STRING "" FORCE)
+          # KRIPTON-FAST-END
+          FASTCMAKE
+          sed -i -E 's/^          //' "$FAST_BLOCK"
+          apply_fast() { { cat "$FAST_BLOCK"; cat "$CML"; } > "$CML.tmp" && mv "$CML.tmp" "$CML"; }
+          strip_fast() { sed -i '/KRIPTON-FAST-BEGIN/,/KRIPTON-FAST-END/d' "$CML"; }
+          # Tanı: eklentinin kendi bağlam/march/OpenMP/mmap ayarları (flash-attn, KV tipi, mmap, mlock alanları var mı?)
+          echo "--- CMake march/openmp/lto:"; grep -nEi 'march|mcpu|openmp|GGML_LTO|GGML_NATIVE|ARM_ARCH' "$CML" | head -20 || true
+          echo "--- eklenti cpp bağlam parametreleri:"
+          grep -rnEi 'flash_attn|type_k|type_v|use_mmap|use_mlock|n_threads_batch|n_batch|cache_prompt|n_ubatch' "$PLUGIN/android/src/main/cpp" 2>/dev/null | head -30 || true
+          # NO_EVENT_SINK tanısı (yalnızca bilgi): eklentinin native kodu, kullanılan sürümde bu hatayı hâlâ
+          # üretiyorsa uyarı bas. Dart tarafı (LlamaEngine) önce aboneliği kurup yeniden dener, olmazsa akışsız moda düşer;
+          # bu yüzden burada kaynak DEĞİŞTİRİLMEZ ve build asla bozulmaz.
+          if [ -n "$PLUGIN" ]; then
+            SINK_HITS=$(grep -rn "NO_EVENT_SINK" "$PLUGIN/android/src" 2>/dev/null | head -5 || true)
+            if [ -n "$SINK_HITS" ]; then
+              echo "::warning::flutter_llama native kodunda NO_EVENT_SINK dönüşü var (Dart tarafı geri-düşme ile telafi eder):"
+              echo "$SINK_HITS"
+            else
+              echo "::warning::flutter_llama android kaynağında NO_EVENT_SINK bulunamadı; native yama gerekmiyor/uygulanamadı."
+            fi
+          fi
+          # Tüm Android alt projelerini (eklentiler) compileSdk 36 ile derle:
+          # flutter_plugin_android_lifecycle >= 36 ister, file_picker ise 34'e sabitlenmiş
+          mkdir -p "$HOME/.gradle/init.d"
+          cat > "$HOME/.gradle/init.d/force-compile-sdk.gradle" <<'GRADLE'
+          allprojects { proj ->
+              proj.afterEvaluate { p ->
+                  def ext = p.extensions.findByName('android')
+                  if (ext != null) {
+                      if (p.plugins.hasPlugin('com.android.application')) {
+                          try { ext.defaultConfig.ndk.abiFilters.clear(); ext.defaultConfig.ndk.abiFilters.add('arm64-v8a') } catch (Throwable t) { println "abiFilters atlandi: ${t.message}" }
+                      }
+                      try { ext.compileSdk = 36 } catch (Throwable t) { println "compileSdk override atlandi: ${p.name}: ${t.message}" }
+                  }
+              }
+          }
+          GRADLE
+          NDK_BIN="${ANDROID_HOME:-$ANDROID_SDK_ROOT}/ndk/28.2.13676358/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          build_apk() {
+            flutter build apk --release --no-tree-shake-icons --target-platform android-arm64 2>&1 | tee "$RUNNER_TEMP/build.log"
+            test -f build/app/outputs/flutter-apk/app-release.apk
+          }
+          # SIGILL ön denetimi (x86 runner'da arm64 çalıştırılamaz => statik): .so içinde SVE/SME/bf16 komutu olmamalı.
+          # Ayrıca smmla/usmmla/sdot sayısı bayrakların gerçekten etkili olduğunu gösterir (0 ise uyarı).
+          sigill_check() {
+            local OD="$NDK_BIN/llvm-objdump" bad=0 seen=0 f n
+            [ -x "$OD" ] || { echo "::warning::llvm-objdump yok; SIGILL denetimi atlandı"; return 0; }
+            while IFS= read -r f; do
+              n=$("$OD" -d --no-show-raw-insn --mattr=+v9.2a,+sve,+sve2,+sme,+bf16,+i8mm,+dotprod,+fullfp16 "$f" 2>/dev/null \
+                | grep -cE '\bz[0-9]+\.[bhsd]\b|\bp[0-9]+/[mz]\b|\bsmstart\b|\bsmstop\b|\bbfmmla\b|\bbfdot\b|\bbfmlal[bt]\b' || true)
+              seen=$((seen+1))
+              echo "SIGILL denetimi: $(basename "$f") SVE/SME/bf16 komut sayısı=$n"
+              [ "${n:-0}" -eq 0 ] || bad=1
+              local m
+              m=$("$OD" -d --no-show-raw-insn --mattr=+v9.2a,+i8mm,+dotprod,+fullfp16 "$f" 2>/dev/null | grep -cE '\b(smmla|usmmla|sdot|udot)\b' || true)
+              echo "  i8mm/dotprod komut sayısı=$m"
+              [ "${m:-0}" -gt 0 ] || echo "::warning::$(basename "$f"): i8mm/dotprod komutu yok; -march bayrağı etkisiz olabilir"
+            done < <(find build android -path '*arm64-v8a*' -name '*.so' \( -name '*llama*' -o -name '*ggml*' \) 2>/dev/null | sort -u)
+            [ "$seen" -gt 0 ] || echo "::warning::SIGILL denetimi: llama/ggml .so bulunamadı"
+            return $bad
+          }
+          apply_fast
+          if build_apk && sigill_check; then
+            echo "ARMv9 hızlı derleme kullanıldı."
+          else
+            echo "::warning::Hızlı derleme veya SIGILL denetimi başarısız; güvenli (varsayılan bayrak) derlemeye dönülüyor"
+            strip_fast
+            flutter clean >/dev/null 2>&1 || true
+            rm -rf "$PLUGIN/android/.cxx"
+            flutter pub get
+            build_apk
+          fi
+          EOF
+
+      - name: APK derle
+        shell: bash
+        run: bash "$RUNNER_TEMP/build.sh"
+
+      - name: Hata tanısı (yalnızca build başarısızsa)
+        if: failure()
+        shell: bash
+        run: |
+          echo "=============== CMake hataları ==============="
+          grep -n -A8 -E "CMake Error|fatal error|undefined reference|error:|FAILURE|What went wrong" "$RUNNER_TEMP/build.log" | grep -v "CMake Warning" | head -90 || true
+          LLAMA="$HOME/.pub-cache/hosted/pub.dev/flutter_llama-1.1.2/android"
+          echo "=============== flutter_llama/android ==============="
+          ls -la "$LLAMA" "$LLAMA/src/main/cpp" || true
+          echo "=============== CMakeLists.txt ==============="
+          head -100 "$LLAMA/src/main/cpp/CMakeLists.txt" || true
+          echo "=============== build.gradle ==============="
+          cat "$LLAMA/build.gradle" || true
+
+      - name: APK dosyasını hazırla
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          APK="dist/Kripton-${TAG}.apk"
+          cp build/app/outputs/flutter-apk/app-release.apk "$APK"
+          (cd dist && sha256sum "$(basename "$APK")" > "$(basename "$APK").sha256")
+          ls -lh dist
+          echo "APK_PATH=${APK}" >> "$GITHUB_ENV"
+
+      - name: Artifact olarak yükle
+        uses: actions/upload-artifact@v4
+        with:
+          name: Kripton-${{ env.TAG }}
+          path: dist/*
+          retention-days: 14
+
+      - name: GitHub Release yayınla
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ env.TAG }}
+          target_commitish: ${{ github.sha }}
+          name: Kripton ${{ env.TAG }}
+          generate_release_notes: true
+          make_latest: true
+          fail_on_unmatched_files: true
+          files: |
+            dist/*.apk
+            dist/*.sha256
