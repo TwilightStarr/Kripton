@@ -63,8 +63,8 @@ class RoutingEngine implements LlmEngine, StreamStatusSource, BackendReporter {
 
   @override
   LiteRtBackend? get activeBackend {
-    final a = _active;
-    return a is BackendReporter ? a.activeBackend : null;
+    final Object? a = _active;
+    return a is BackendReporter ? (a as BackendReporter).activeBackend : null;
   }
 
   @override
@@ -110,8 +110,9 @@ class RoutingEngine implements LlmEngine, StreamStatusSource, BackendReporter {
     try {
       await e.stop();
     } catch (_) {}
-    if (e is UnloadableEngine) {
-      await e.unload();
+    final Object eo = e;
+    if (eo is UnloadableEngine) {
+      await (eo as UnloadableEngine).unload();
     } else {
       await e.dispose(); // LlamaEngine: stop + unload; sonrasında yeniden kullanılabilir
     }
