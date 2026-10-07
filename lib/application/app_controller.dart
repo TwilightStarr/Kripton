@@ -14,6 +14,7 @@ import '../data/native_services.dart';
 import '../data/project_snapshot.dart';
 import '../data/project_source.dart';
 import '../data/project_zip.dart';
+import '../data/routing_engine.dart';
 import '../data/storage.dart';
 import '../domain/entities.dart';
 import '../domain/inference_settings.dart';
@@ -46,7 +47,7 @@ final deviceRamProvider = Provider<Future<int?> Function()>(
   },
 );
 final engineProvider = Provider<LlmEngine>((ref) {
-  final e = LlamaEngine();
+  final e = RoutingEngine(); // .gguf -> LlamaEngine, .litertlm/.task -> LiteRtEngine
   ref.onDispose(e.dispose);
   return e;
 });
