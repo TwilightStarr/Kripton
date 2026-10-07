@@ -39,7 +39,10 @@ class RoutingEngine implements LlmEngine, StreamStatusSource, BackendReporter {
 
   void _bindFallback(LlmEngine e) {
     _fbSource?.removeListener(_mirror);
-    _fbSource = e is StreamStatusSource ? e.streamFallback : null;
+    _fbSource = switch (e) {
+      final StreamStatusSource s => s.streamFallback,
+      _ => null,
+    };
     _fbSource?.addListener(_mirror);
     _mirror();
   }

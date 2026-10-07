@@ -477,7 +477,10 @@ class ChatController extends Notifier<ChatState> {
     // Artımlı filtre: ham tampon tutulmaz, her token'da tüm metin yeniden taranmaz.
     final filter = ChatStreamFilter();
     // Canlı akış yedek bilgisi (LlamaEngine bildirir; sahte motorlar bildirmeyebilir).
-    final StreamStatusSource? streamSrc = engine is StreamStatusSource ? engine : null;
+    final StreamStatusSource? streamSrc = switch (engine) {
+      final StreamStatusSource s => s,
+      _ => null,
+    };
     void onFallback() {
       if (_disposed || streamSrc == null) return;
       final v = streamSrc.streamFallback.value;
