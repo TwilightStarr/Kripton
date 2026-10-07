@@ -1,3 +1,4 @@
+// Değişiklik: draft yalnızca canlı balonu yeniden kurar (sayfa select ile), TypewriterText + 'Yazı animasyonu' menüsü, akış yedek bilgi satırı, kalıcı balon canlı balonun devamı (zıplama yok).
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
@@ -8,12 +9,14 @@ import '../application/chat_controller.dart';
 import '../application/settings_controller.dart';
 import '../core/theme.dart';
 import '../domain/chat_models.dart';
+import '../domain/chat_type_mode.dart';
 import '../domain/entities.dart';
 import 'chat_memory_sheet.dart';
 import 'dev_mode_page.dart';
 import 'home_page.dart';
 import 'model_manager_page.dart';
 import 'theme_sheet.dart';
+import 'typewriter_text.dart';
 
 /// Sohbet modu: diğer modlardan bağımsız, çevrimdışı bir model ile kalıcı hafızalı konuşma.
 ///
@@ -31,6 +34,8 @@ class ChatPage extends ConsumerStatefulWidget {
 class _ChatPageState extends ConsumerState<ChatPage> {
   final _input = TextEditingController();
   final _focus = FocusNode();
+  final _typer = TypewriterController();
+  bool _fallbackDismissed = false;
 
   @override
   void initState() {
@@ -44,6 +49,7 @@ class _ChatPageState extends ConsumerState<ChatPage> {
   void dispose() {
     _input.dispose();
     _focus.dispose();
+    _typer.dispose();
     super.dispose();
   }
 
@@ -92,10 +98,35 @@ class _ChatPageState extends ConsumerState<ChatPage> {
     );
   }
 
+  Future<void> _pickTypeMode() async {
+    await showModalBottomSheet<void>(
+      context: context,
+      builder: (_) => const _TypeModeSheet(),
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
-    final s = ref.watch(chatProvider);
+    // draft/phase her token'da değişir: sayfa bunları İZLEMEZ (yalnızca canlı balon izler).
+    final s = ref.watch(
+      chatProvider.select(
+        (x) => (
+          loaded: x.loaded,
+          messages: x.messages,
+          totalMessages: x.totalMessages,
+          hasOlder: x.hasOlder,
+          sources: x.sources,
+          pins: x.pins,
+          generating: x.generating,
+          preparing: x.preparing,
+          error: x.error,
+          settleId: x.settleId,
+          streamFallback: x.streamFallback,
+        ),
+      ),
+    );
     final c = ref.read(chatProvider.notifier);
+    final typeMode = ref.watch(settingsProvider.select((x) => x.chatTypeMode));
     final model = ref.watch(chatModelProvider);
     final modelsLoaded = ref.watch(chatModelsLoadedProvider);
     final wfBusy = ref.watch(workflowBusyProvider);
@@ -111,6 +142,12 @@ class _ChatPageState extends ConsumerState<ChatPage> {
     ref.listen<bool>(chatProvider.select((x) => x.loaded), (prev, next) {
       if (prev == false && next) c.prepare();
     });
+    ref.listen<bool>(chatProvider.select((x) => x.generating), (prev, next) {
+      if (next && prev != true) _typer.reset(); // yeni yanıt: animasyon durumu sıfırlanır
+    });
+    ref.listen<bool>(chatProvider.select((x) => x.streamFallback), (prev, next) {
+      if (!next && _fallbackDismissed) setState(() => _fallbackDismissed = false);
+    });
     ref.listen<int>(chatProvider.select((x) => x.noticeId), (_, __) {
       final m = ref.read(chatProvider).notice;
       if (m != null) _snack(m);
@@ -118,6 +155,7 @@ class _ChatPageState extends ConsumerState<ChatPage> {
 
     final msgs = s.messages;
     final live = s.generating;
+    if (live) _typer.live = true;
     final count = msgs.length + (live ? 1 : 0) + (s.hasOlder ? 1 : 0);
     final chunks = s.sources.fold<int>(0, (a, x) => a + x.chunks.length);
     final lastIsUser = msgs.isNotEmpty && msgs.last.role == ChatRole.user;
@@ -175,6 +213,8 @@ class _ChatPageState extends ConsumerState<ChatPage> {
                   await Navigator.of(context).push(MaterialPageRoute<void>(builder: (_) => const ModelManagerPage()));
                 case 'look':
                   await showAppearanceSheet(context);
+                case 'typing':
+                  await _pickTypeMode();
                 case 'export':
                   final path = await c.exportHistory();
                   if (path != null) await OpenFilex.open(path);
@@ -191,6 +231,17 @@ class _ChatPageState extends ConsumerState<ChatPage> {
               const PopupMenuItem(value: 'model', child: Text('Model seç')),
               const PopupMenuItem(value: 'models', child: Text('Model yöneticisi')),
               const PopupMenuItem(value: 'look', child: Text('Görünüm ve açılış ekranı')),
+              PopupMenuItem(
+                value: 'typing',
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    const Text('Yazı animasyonu'),
+                    Text(typeMode.label, style: TextStyle(fontSize: 11.5, color: KColors.muted)),
+                  ],
+                ),
+              ),
               CheckedPopupMenuItem(
                 value: 'autoPrepare',
                 checked: autoPrepare,
@@ -269,7 +320,7 @@ class _ChatPageState extends ConsumerState<ChatPage> {
                         itemCount: count,
                         itemBuilder: (_, i) {
                           if (live && i == 0) {
-                            return _LiveBubble(text: s.draft, phase: s.phase, recalled: s.lastRecalled);
+                            return _LiveBubble(typer: _typer, mode: typeMode);
                           }
                           final j = i - (live ? 1 : 0);
                           if (j == msgs.length) {
@@ -282,14 +333,25 @@ class _ChatPageState extends ConsumerState<ChatPage> {
                             );
                           }
                           final m = msgs[msgs.length - 1 - j];
+                          // Az önce canlı balondan dönüşen yanıt: animasyon kaldığı yerden sürer (zıplama yok).
+                          final settle = m.id == s.settleId && _typer.live && m.role == ChatRole.assistant;
                           return _Bubble(
                             key: ValueKey(m.id),
                             message: m,
                             onLongPress: () => _messageMenu(m),
+                            typer: settle ? _typer : null,
+                            mode: typeMode,
                           );
                         },
                       ),
           ),
+          if (s.streamFallback && !_fallbackDismissed)
+            _Banner(
+              color: KColors.amber,
+              icon: Icons.info_outline,
+              text: 'Canlı akış kullanılamıyor; yanıt hazır olunca yazılıyor.',
+              onClose: () => setState(() => _fallbackDismissed = true),
+            ),
           if (wfBusy)
             _Banner(
               color: KColors.amber,
@@ -324,7 +386,10 @@ class _ChatPageState extends ConsumerState<ChatPage> {
             preparing: s.preparing,
             enabled: s.loaded,
             onSend: _send,
-            onStop: c.stop,
+            onStop: () {
+              _typer.freeze(); // animasyon hemen durur, görünen kısım kalır
+              c.stop(visibleChars: _typer.visibleCodeUnits);
+            },
           ),
         ],
       ),
@@ -432,10 +497,21 @@ class _EmptyChat extends StatelessWidget {
 }
 
 class _Bubble extends StatelessWidget {
-  const _Bubble({super.key, required this.message, required this.onLongPress});
+  const _Bubble({
+    super.key,
+    required this.message,
+    required this.onLongPress,
+    this.typer,
+    this.mode = ChatTypeMode.letter,
+  });
 
   final ChatMessage message;
   final VoidCallback onLongPress;
+
+  /// Doluysa bu balon az önce canlı balondan dönüşmüştür: animasyon kaldığı yerden tamamlanır.
+  /// Boşsa metin baştan tam gösterilir (animasyon yok).
+  final TypewriterController? typer;
+  final ChatTypeMode mode;
 
   String _time(int ts) {
     final t = DateTime.fromMillisecondsSinceEpoch(ts);
@@ -465,7 +541,16 @@ class _Bubble extends StatelessWidget {
             crossAxisAlignment: CrossAxisAlignment.start,
             mainAxisSize: MainAxisSize.min,
             children: [
-              Text(message.text, style: TextStyle(fontSize: 14.5, height: 1.4, color: KColors.text)),
+              if (typer == null)
+                Text(message.text, style: TextStyle(fontSize: 14.5, height: 1.4, color: KColors.text))
+              else
+                TypewriterText(
+                  text: message.text,
+                  done: true,
+                  mode: mode,
+                  controller: typer!,
+                  style: TextStyle(fontSize: 14.5, height: 1.4, color: KColors.text),
+                ),
               const SizedBox(height: 4),
               Text(_time(message.ts), style: TextStyle(fontSize: 10.5, color: KColors.muted)),
             ],
@@ -476,15 +561,18 @@ class _Bubble extends StatelessWidget {
   }
 }
 
-class _LiveBubble extends StatelessWidget {
-  const _LiveBubble({required this.text, required this.phase, required this.recalled});
+/// Üretilmekte olan yanıt. Yalnızca bu widget `draft`/`phase`'i izler; sayfa her token'da yeniden kurulmaz.
+class _LiveBubble extends ConsumerWidget {
+  const _LiveBubble({required this.typer, required this.mode});
 
-  final String text;
-  final String phase;
-  final int recalled;
+  final TypewriterController typer;
+  final ChatTypeMode mode;
 
   @override
-  Widget build(BuildContext context) {
+  Widget build(BuildContext context, WidgetRef ref) {
+    final text = ref.watch(chatProvider.select((x) => x.draft));
+    final phase = ref.watch(chatProvider.select((x) => x.phase));
+    final recalled = ref.watch(chatProvider.select((x) => x.lastRecalled));
     return Align(
       alignment: Alignment.centerLeft,
       child: Container(
@@ -500,7 +588,14 @@ class _LiveBubble extends StatelessWidget {
           crossAxisAlignment: CrossAxisAlignment.start,
           mainAxisSize: MainAxisSize.min,
           children: [
-            if (text.isNotEmpty) Text(text, style: TextStyle(fontSize: 14.5, height: 1.4, color: KColors.text)),
+            if (text.isNotEmpty)
+              TypewriterText(
+                text: text,
+                done: false,
+                mode: mode,
+                controller: typer,
+                style: TextStyle(fontSize: 14.5, height: 1.4, color: KColors.text),
+              ),
             if (text.isNotEmpty) const SizedBox(height: 8),
             Row(
               mainAxisSize: MainAxisSize.min,
@@ -629,6 +724,56 @@ class _InputBar extends StatelessWidget {
                           )
                         : const Icon(Icons.arrow_upward_rounded),
                   ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+class _TypeModeSheet extends ConsumerWidget {
+  const _TypeModeSheet();
+
+  static const _hints = {
+    ChatTypeMode.off: 'Yanıt hazır olur olmaz tamamı görünür.',
+    ChatTypeMode.word: 'Yanıt kelime kelime yazılır.',
+    ChatTypeMode.letter: 'Yanıt harf harf yazılır (varsayılan).',
+  };
+
+  @override
+  Widget build(BuildContext context, WidgetRef ref) {
+    final current = ref.watch(settingsProvider.select((x) => x.chatTypeMode));
+    return SafeArea(
+      child: Padding(
+        padding: const EdgeInsets.fromLTRB(18, 0, 18, 18),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Text('Yazı animasyonu', style: TextStyle(fontSize: 18, fontWeight: FontWeight.w800, color: KColors.text)),
+            const SizedBox(height: 4),
+            Text(
+              'Balona dokununca animasyon atlanır. Sistem animasyonları kapalıysa metin hep anında görünür.',
+              style: TextStyle(fontSize: 12.5, height: 1.35, color: KColors.muted),
+            ),
+            const SizedBox(height: 12),
+            for (final m in ChatTypeMode.values)
+              Container(
+                margin: const EdgeInsets.only(bottom: 8),
+                decoration: kCardDecoration(),
+                child: ListTile(
+                  onTap: () {
+                    ref.read(settingsProvider.notifier).setChatTypeMode(m);
+                    Navigator.pop(context);
+                  },
+                  leading: Icon(
+                    m == current ? Icons.radio_button_checked : Icons.radio_button_off,
+                    color: m == current ? KColors.accent : KColors.muted,
+                  ),
+                  title: Text(m.label, style: TextStyle(fontWeight: FontWeight.w700, color: KColors.text)),
+                  subtitle: Text(_hints[m]!, style: TextStyle(fontSize: 12, color: KColors.muted)),
+                ),
+              ),
           ],
         ),
       ),

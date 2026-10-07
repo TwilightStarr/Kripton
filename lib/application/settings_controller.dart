@@ -1,7 +1,9 @@
+// Değişiklik: AppSettings.chatTypeMode (kapalı/kelime/harf; eski kayıtlarda harf) + setChatTypeMode eklendi.
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import '../core/theme.dart';
 import '../data/storage.dart';
+import '../domain/chat_type_mode.dart';
 import '../domain/start_screen.dart';
 import 'app_controller.dart' show storageProvider;
 
@@ -24,12 +26,16 @@ class AppSettings {
   /// Düşük RAM'li telefonlarda kapatılabilir (model ilk mesajda yüklenir).
   final bool chatAutoPrepare;
 
+  /// Sohbette yanıtın yazılış animasyonu (varsayılan: harf harf).
+  final ChatTypeMode chatTypeMode;
+
   const AppSettings({
     this.themeId = 'gece',
     this.liteOnStart = false,
     this.startScreen = StartScreen.flow,
     this.chatModelId,
     this.chatAutoPrepare = true,
+    this.chatTypeMode = ChatTypeMode.letter,
   });
 
   AppSettings copyWith({
@@ -38,12 +44,14 @@ class AppSettings {
     StartScreen? startScreen,
     String? chatModelId,
     bool? chatAutoPrepare,
+    ChatTypeMode? chatTypeMode,
   }) => AppSettings(
         themeId: themeId ?? this.themeId,
         liteOnStart: liteOnStart ?? this.liteOnStart,
         startScreen: startScreen ?? this.startScreen,
         chatModelId: chatModelId ?? this.chatModelId,
         chatAutoPrepare: chatAutoPrepare ?? this.chatAutoPrepare,
+        chatTypeMode: chatTypeMode ?? this.chatTypeMode,
       );
 
   Map<String, dynamic> toJson() => {
@@ -52,6 +60,7 @@ class AppSettings {
         'startScreen': startScreen.name,
         if (chatModelId != null) 'chatModel': chatModelId,
         'chatAutoPrepare': chatAutoPrepare,
+        'chatTypeMode': chatTypeMode.name,
       };
 
   factory AppSettings.fromJson(Map<String, dynamic> j) => AppSettings(
@@ -60,6 +69,7 @@ class AppSettings {
         startScreen: startScreenFromId(j['startScreen']),
         chatModelId: j['chatModel'] is String ? j['chatModel'] as String : null,
         chatAutoPrepare: j['chatAutoPrepare'] != false,
+        chatTypeMode: ChatTypeMode.fromId(j['chatTypeMode']),
       );
 
   /// Açılışta (runApp'ten önce) okunur; hata olursa varsayılanlar döner.
@@ -117,6 +127,12 @@ class SettingsController extends Notifier<AppSettings> {
   void setChatAutoPrepare(bool v) {
     if (state.chatAutoPrepare == v) return;
     state = state.copyWith(chatAutoPrepare: v);
+    _save();
+  }
+
+  void setChatTypeMode(ChatTypeMode v) {
+    if (state.chatTypeMode == v) return;
+    state = state.copyWith(chatTypeMode: v);
     _save();
   }
 

@@ -1,3 +1,4 @@
+// Değişiklik: artımlı filtre (O(n²) kalktı), _replying re-entrancy bayrağı, canlı balon↔kalıcı mesaj tek karede devri (settleId), akış yedek bilgisi, stop(visibleChars).
 import 'dart:async';
 import 'dart:io';
 import 'dart:isolate';
@@ -17,6 +18,7 @@ import '../domain/entities.dart';
 import '../domain/inference_settings.dart';
 import 'app_controller.dart';
 import 'chat_memory.dart';
+import 'chat_stream_filter.dart';
 import 'engine_lock.dart';
 import 'settings_controller.dart';
 import 'token_budget.dart';
@@ -95,6 +97,8 @@ class ChatState {
     this.noticeId = 0,
     this.lastRecalled = 0,
     this.importing = false,
+    this.streamFallback = false,
+    this.settleId,
   });
 
   final bool loaded;
@@ -124,6 +128,12 @@ class ChatState {
   final int lastRecalled;
   final bool importing;
 
+  /// Canlı akış kullanılamıyor; yanıt akışsız (complete) yolla, hazır olunca geliyor.
+  final bool streamFallback;
+
+  /// Canlı balondan az önce kalıcı mesaja dönüşen yanıtın kimliği (arayüz animasyonu aynı balonda sürdürür).
+  final String? settleId;
+
   bool get hasOlder => messages.length < totalMessages;
 
   ChatState copyWith({
@@ -142,6 +152,9 @@ class ChatState {
     int? noticeId,
     int? lastRecalled,
     bool? importing,
+    bool? streamFallback,
+    String? settleId,
+    bool clearSettle = false,
   }) => ChatState(
     loaded: loaded ?? this.loaded,
     messages: messages ?? this.messages,
@@ -157,6 +170,8 @@ class ChatState {
     noticeId: noticeId ?? this.noticeId,
     lastRecalled: lastRecalled ?? this.lastRecalled,
     importing: importing ?? this.importing,
+    streamFallback: streamFallback ?? this.streamFallback,
+    settleId: clearSettle ? null : (settleId ?? this.settleId),
   );
 }
 
@@ -167,6 +182,12 @@ class ChatController extends Notifier<ChatState> {
   int _shown = kChatPageSize;
   int _seq = 0;
   bool _cancelled = false;
+
+  /// Durdur'a basıldığında ekranda görünen karakter sayısı (kod birimi); null = tümü.
+  int? _stopVisibleChars;
+
+  /// send / retry / prepare sürerken yeniden girişi engeller (state.generating henüz true olmadan da).
+  bool _replying = false;
   bool _disposed = false;
   bool _prepareAfterInit = false;
   bool _prepareManualAfterInit = false;
@@ -278,10 +299,21 @@ class ChatController extends Notifier<ChatState> {
 
   List<MemoryItem> _pinItems() => [for (final p in _memory.pins) _pinItem(p)];
 
-  Future<void> _persistMessage(ChatMessage m) async {
+  /// Mesajı listeye ekler, ardından diske yazar. [endLive] true ise canlı balon (generating/draft/phase)
+  /// AYNI state güncellemesinde kapatılır: canlı balon ile kalıcı mesaj aynı karede el değiştirir.
+  Future<void> _persistMessage(ChatMessage m, {bool endLive = false}) async {
     _all.add(m);
     _index.add(_msgItem(m));
-    state = state.copyWith(messages: _window(), totalMessages: _all.length);
+    state = endLive
+        ? state.copyWith(
+            messages: _window(),
+            totalMessages: _all.length,
+            generating: false,
+            phase: '',
+            draft: '',
+            settleId: m.id,
+          )
+        : state.copyWith(messages: _window(), totalMessages: _all.length);
     try {
       await ref.read(chatStoreProvider).append(m);
     } catch (e) {
@@ -294,7 +326,7 @@ class ChatController extends Notifier<ChatState> {
   /// Kullanıcı mesajını (hemen kalıcı olarak) kaydeder ve yanıt üretir.
   Future<void> send(String raw) async {
     final text = raw.trim();
-    if (text.isEmpty || state.generating || state.preparing || !state.loaded) return;
+    if (text.isEmpty || _replying || state.generating || state.preparing || !state.loaded) return;
     if (ref.read(workflowBusyProvider)) {
       _notice('Bir AI akışı çalışıyor; bitince sohbete dönebilirsin.');
       return;
@@ -310,13 +342,18 @@ class ChatController extends Notifier<ChatState> {
       text: text,
       ts: DateTime.now().millisecondsSinceEpoch,
     );
-    await _persistMessage(um);
-    await _reply(model, um);
+    _replying = true;
+    try {
+      await _persistMessage(um);
+      await _reply(model, um);
+    } finally {
+      _replying = false;
+    }
   }
 
   /// Son mesaj kullanıcınınsa (yanıt üretilemediyse) yanıtı yeniden dener; mesaj tekrar eklenmez.
   Future<void> retry() async {
-    if (state.generating || state.preparing || !state.loaded || _all.isEmpty) return;
+    if (_replying || state.generating || state.preparing || !state.loaded || _all.isEmpty) return;
     final last = _all.last;
     if (last.role != ChatRole.user) return;
     if (ref.read(workflowBusyProvider)) {
@@ -328,7 +365,12 @@ class ChatController extends Notifier<ChatState> {
       _notice('Sohbet için önce Model yöneticisinden bir model indir.');
       return;
     }
-    await _reply(model, last);
+    _replying = true;
+    try {
+      await _reply(model, last);
+    } finally {
+      _replying = false;
+    }
   }
 
   /// Sohbet modelini ilk mesajı beklemeden yükler (ayar: [AppSettings.chatAutoPrepare]).
@@ -337,7 +379,7 @@ class ChatController extends Notifier<ChatState> {
   /// veya ayar kapalıysa ([manual] değilse). [chatBusyProvider] bilerek açılmaz: motor kapısı
   /// (_gate) yükleme ile diğer işleri zaten sıraya koyar.
   Future<void> prepare({bool manual = false}) async {
-    if (_disposed || state.generating || state.preparing) return;
+    if (_disposed || _replying || state.generating || state.preparing) return;
     if (!manual && !ref.read(settingsProvider).chatAutoPrepare) return;
     if (!state.loaded) {
       _prepareAfterInit = true;
@@ -352,6 +394,7 @@ class ChatController extends Notifier<ChatState> {
     final sw = Stopwatch()..start();
     String? lastId = first.id;
     var failed = false;
+    _replying = true;
     state = state.copyWith(
       preparing: true,
       phase: 'Model hazırlanıyor…',
@@ -382,12 +425,16 @@ class ChatController extends Notifier<ChatState> {
         '${sw.elapsedMilliseconds}ms model=$lastId${failed ? ' (hata)' : ''}',
         null,
       );
+      _replying = false;
       if (!_disposed) state = state.copyWith(preparing: false, phase: '');
     }
   }
 
-  Future<void> stop() async {
+  /// [visibleChars]: Durdur'a basıldığı anda ekranda görünen karakter sayısı (yazı animasyonu geride
+  /// kalmış olabilir); verilirse kaydedilen yanıt yalnızca görünen kısımla sınırlanır.
+  Future<void> stop({int? visibleChars}) async {
     if (!state.generating) return;
+    _stopVisibleChars = visibleChars;
     _cancelled = true;
     final s = _cancelSignal;
     if (s != null && !s.isCompleted) s.complete();
@@ -411,6 +458,7 @@ class ChatController extends Notifier<ChatState> {
   Future<void> _reply(GgufModel m, ChatMessage userMsg) async {
     final engine = ref.read(engineProvider);
     _cancelled = false;
+    _stopVisibleChars = null;
     final signal = Completer<void>();
     _cancelSignal = signal;
     ref.read(chatBusyProvider.notifier).state = true;
@@ -420,12 +468,23 @@ class ChatController extends Notifier<ChatState> {
       phase: alreadyLoaded ? 'Hafıza taranıyor…' : 'Model hazırlanıyor…',
       draft: '',
       clearError: true,
+      clearSettle: true,
     );
     _prepareError = false;
     try {
       await WakelockPlus.enable();
     } catch (_) {}
-    final b = StringBuffer();
+    // Artımlı filtre: ham tampon tutulmaz, her token'da tüm metin yeniden taranmaz.
+    final filter = ChatStreamFilter();
+    // Canlı akış yedek bilgisi (LlamaEngine bildirir; sahte motorlar bildirmeyebilir).
+    final StreamStatusSource? streamSrc = engine is StreamStatusSource ? engine : null;
+    void onFallback() {
+      if (_disposed || streamSrc == null) return;
+      final v = streamSrc.streamFallback.value;
+      if (state.streamFallback != v) state = state.copyWith(streamFallback: v);
+    }
+
+    streamSrc?.streamFallback.addListener(onFallback);
     try {
       await engine.ensureLoaded(m.localPath!, expectedBytes: m.sizeBytes);
       if (_cancelled) return;
@@ -498,9 +557,8 @@ class ChatController extends Notifier<ChatState> {
           .listen(
             (t) {
               if (_cancelled || thinkCut || markerCut) return;
-              b.write(t);
-              final (shown, hitMarker) = ChatOutputFilter.clean(b.toString());
-              if (hitMarker) {
+              filter.add(t);
+              if (filter.hitMarker) {
                 markerCut = true;
                 _stopQuietly(engine);
                 if (!done.isCompleted) done.complete();
@@ -512,8 +570,7 @@ class ChatController extends Notifier<ChatState> {
                   if (!done.isCompleted) done.complete();
                 }
               }
-              final (vis, thk) = ChatOutputFilter.splitThink(shown);
-              _pushDraft(vis, thk);
+              _pushDraft(filter.visible, filter.thinking);
             },
             onError: (Object e, StackTrace st) {
               if (!done.isCompleted) done.completeError(e, st);
@@ -537,9 +594,14 @@ class ChatController extends Notifier<ChatState> {
         } catch (_) {}
       }
 
-      final (cleaned, _) = ChatOutputFilter.clean(b.toString());
-      final (visible, thinking) = ChatOutputFilter.splitThink(cleaned);
-      final answer = visible.trim();
+      filter.finish();
+      final thinking = filter.thinking;
+      var answer = filter.visible.trim();
+      // Durdur'da yalnızca ekranda görünen kısım kaydedilir (animasyon geride kalmış olabilir).
+      final cut = _stopVisibleChars;
+      if (_cancelled && cut != null && cut < answer.length) {
+        answer = answer.substring(0, math.max(0, cut)).trimRight();
+      }
       if (answer.isEmpty) {
         if (_cancelled) return;
         throw StateError(
@@ -556,12 +618,12 @@ class ChatController extends Notifier<ChatState> {
           ts: DateTime.now().millisecondsSinceEpoch,
           modelId: m.id,
         ),
+        endLive: true,
       );
     } catch (e) {
       // Yarım kalan yanıt varsa kaybolmasın.
-      final (cleaned, _) = ChatOutputFilter.clean(b.toString());
-      final (visible, _) = ChatOutputFilter.splitThink(cleaned);
-      final partial = visible.trim();
+      filter.finish();
+      final partial = filter.visible.trim();
       if (partial.isNotEmpty) {
         await _persistMessage(
           ChatMessage(
@@ -571,16 +633,18 @@ class ChatController extends Notifier<ChatState> {
             ts: DateTime.now().millisecondsSinceEpoch,
             modelId: m.id,
           ),
+          endLive: true,
         );
       }
       state = state.copyWith(error: _errText(e));
     } finally {
+      streamSrc?.streamFallback.removeListener(onFallback);
       SamplingScope.reset();
       ref.read(chatBusyProvider.notifier).state = false;
       try {
         await WakelockPlus.disable();
       } catch (_) {}
-      state = state.copyWith(generating: false, phase: '', draft: '');
+      state = state.copyWith(generating: false, phase: '', draft: '', streamFallback: false);
     }
   }
 

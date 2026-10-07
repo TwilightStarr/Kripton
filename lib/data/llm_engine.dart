@@ -1,7 +1,9 @@
+// Değişiklik: akış kalıcı bırakılmaz (yeni modelde + 5 dk'da yeniden denenir), "Akış bırakıldı/hatası" günlüğü, StreamStatusSource (yedek bilgisi), NO_EVENT_SINK sonrası kademeli listen payı.
 import 'dart:async';
 import 'dart:io';
 import 'dart:math' as math;
 
+import 'package:flutter/foundation.dart' show ValueListenable, ValueNotifier;
 import 'package:flutter/services.dart';
 import 'package:flutter_llama/flutter_llama.dart';
 
@@ -205,6 +207,14 @@ abstract class LlmEngine {
   int? get batchSize;
 }
 
+/// Canlı akışın durumunu bildiren motorlar ([LlamaEngine]) uygular; sahte motorlar zorunlu değil.
+/// Sohbet ekranı bunu "Canlı akış kullanılamıyor" bilgi satırı için okur.
+abstract interface class StreamStatusSource {
+  /// true: son üretim akışsız (complete) yedek yolla yapıldı ya da akış geçici olarak bırakıldı.
+  /// Akışla token geldiği anda false olur.
+  ValueListenable<bool> get streamFallback;
+}
+
 /// flutter_llama üzerindeki ince katman. LlamaEngine'deki geri-düşme (fallback)
 /// mantığı bu arayüz sayesinde eklenti olmadan test edilebilir.
 abstract class LlamaBackend {
@@ -402,7 +412,15 @@ class FlutterLlamaBackend implements LlamaBackend {
   // Abonelik native tarafa ulaşsın diye üretim çağrısından önce küçük bir pay.
   // Flutter kanal mesajları gönderim sırasıyla işlenir (listen -> generateStream); 50 ms yerine
   // yalnızca bir olay-döngüsü turu. Yetmezse NO_EVENT_SINK yeniden deneme yolu (LlamaEngine._produce) devrede.
-  static const _listenSettle = Duration.zero;
+  // Ardışık NO_EVENT_SINK hatalarında bu pay kademeli artar (0 -> 250 -> 500 -> 750 ms, en çok 800 ms);
+  // bir token gelince sıfırlanır. Etkisi cihazda DOĞRULANAMADI: native onListen'ın sink'i doldurmasına
+  // zaman tanıma varsayımıdır; işe yaramazsa LlamaEngine yine akışsız yedeğe düşer ve 5 dk sonra yeniden dener.
+  static const _listenSettleBase = Duration.zero;
+  int _noSinkStreak = 0;
+
+  Duration get _listenSettle => _noSinkStreak == 0
+      ? _listenSettleBase
+      : Duration(milliseconds: math.min(800, 250 * _noSinkStreak));
   // invokeMethod döndükten sonra token geldiyse (senkron native) kuyruk boşalma payı.
   // Asıl bitiş sinyali native onDone (endOfStream); bu yalnızca yedek. 2 sn -> 400 ms (her token arm'ı sıfırlar).
   static const _tailGrace = Duration(milliseconds: 400);
@@ -801,6 +819,9 @@ class FlutterLlamaBackend implements LlamaBackend {
     void finish([Object? error, StackTrace? st]) {
       if (finished) return;
       finished = true;
+      if (error is PlatformException && error.code == 'NO_EVENT_SINK') {
+        _noSinkStreak++;
+      }
       logMetrics();
       CrashGuard.endOp();
       watchdog?.cancel();
@@ -826,7 +847,10 @@ class FlutterLlamaBackend implements LlamaBackend {
               if (e is! String || finished) return;
               received++;
               lastMs = swGen.elapsedMilliseconds;
-              if (received == 1) firstMs = lastMs;
+              if (received == 1) {
+                firstMs = lastMs;
+                _noSinkStreak = 0;
+              }
               if (!c.isClosed) c.add(e);
               if (invokeReturned) arm(_tailGrace);
             },
@@ -898,12 +922,20 @@ class _GenRun {
   void Function()? abort;
 }
 
-class LlamaEngine implements LlmEngine {
+class LlamaEngine implements LlmEngine, StreamStatusSource {
   LlamaEngine({
     LlamaBackend? backend,
     Duration retryDelay = const Duration(milliseconds: 150),
+    this.streamRetryInterval = kStreamRetryInterval,
+    DateTime Function()? clock,
   })  : _backend = backend ?? FlutterLlamaBackend(),
-        _retryDelay = retryDelay;
+        _retryDelay = retryDelay,
+        _clock = clock ?? DateTime.now;
+
+  /// Akış bırakıldıktan sonra yeniden deneme aralığı (yeni model yüklenince hemen denenir).
+  static const Duration kStreamRetryInterval = Duration(minutes: 5);
+  final Duration streamRetryInterval;
+  final DateTime Function() _clock;
 
   static final RegExp _chunks = RegExp(r'\S+\s*|\s+');
 
@@ -917,12 +949,51 @@ class LlamaEngine implements LlmEngine {
   _GenRun? _activeRun;
   Future<void> _stopChain = Future<void>.value();
   bool _streamingUnsupported = false;
+  DateTime? _streamDroppedAt;
+  final ValueNotifier<bool> _fallback = ValueNotifier<bool>(false);
 
   @override
   String? get loadedPath => _loaded;
 
-  /// NO_EVENT_SINK / kanal bulunamadı gibi nedenlerle akış kalıcı olarak bırakıldıysa true.
+  @override
+  ValueListenable<bool> get streamFallback => _fallback;
+
+  /// NO_EVENT_SINK / kanal bulunamadı gibi nedenlerle akış şu an bırakılmışsa true.
+  /// Kalıcı değildir: yeni model yüklenince ve [streamRetryInterval] dolunca akış yeniden denenir.
   bool get streamingUnsupported => _streamingUnsupported;
+
+  void _setFallback(bool v) {
+    if (_fallback.value != v) _fallback.value = v;
+  }
+
+  /// Akışı bırakır; nedeni (yalnızca kod + mesaj) CrashGuard.log'a yazılır.
+  void _dropStreaming(String code, String? message) {
+    _streamingUnsupported = true;
+    _streamDroppedAt = _clock();
+    CrashGuard.log(
+      'Akış bırakıldı',
+      'kod=$code mesaj=${message ?? '-'}; ${streamRetryInterval.inMinutes} dk sonra veya model değişince yeniden denenecek',
+      null,
+    );
+  }
+
+  /// Akış deneme izni: bırakılmadıysa true; bırakıldıysa yalnızca bekleme süresi dolduysa true.
+  bool _streamAllowed() {
+    if (!_streamingUnsupported) return true;
+    final at = _streamDroppedAt;
+    if (at != null && _clock().difference(at) >= streamRetryInterval) {
+      _resetStreaming('süre doldu');
+      return true;
+    }
+    return false;
+  }
+
+  void _resetStreaming(String why) {
+    if (!_streamingUnsupported) return;
+    _streamingUnsupported = false;
+    _streamDroppedAt = null;
+    CrashGuard.log('Akış yeniden deneniyor', why, null);
+  }
 
   @override
   int? get contextSize => _loaded == null ? null : _backend.contextSize;
@@ -967,6 +1038,7 @@ class LlamaEngine implements LlmEngine {
     final ok = await _backend.load(path);
     if (!ok) throw StateError('Model yüklenemedi: $path');
     _loaded = path;
+    _resetStreaming('yeni model yüklendi');
   }
 
   @override
@@ -1099,21 +1171,30 @@ class LlamaEngine implements LlmEngine {
   ) async {
     if (run.pressureStopped) return;
     var attemptedStream = false;
-    if (!_streamingUnsupported) {
+    if (_streamAllowed()) {
       for (var attempt = 0;; attempt++) {
         attemptedStream = true;
         try {
           await _pipe(run, c, _backend.stream(prompt, maxTokens));
           if (run.pressureStopped) return;
+          if (run.emitted > 0) _setFallback(false);
           if (run.cancelled || run.emitted > 0) return;
-          break; // hiç token gelmedi: bu çağrıda akışa güvenme, akışsız dene
-        } on MissingPluginException {
+          // Hiç token gelmedi: bu çağrıda akışa güvenme, akışsız dene (kalıcı bırakma yok).
+          CrashGuard.log(
+            'Akış hatası',
+            'akış hata vermeden token üretmeden bitti; akışsız yedeğe geçiliyor',
+            null,
+          );
+          break;
+        } on MissingPluginException catch (e) {
           if (run.pressureStopped) return;
-          _streamingUnsupported = true;
+          CrashGuard.log('Akış hatası', 'kod=MissingPluginException mesaj=${e.message}', null);
+          _dropStreaming('MissingPluginException', e.message);
           break;
         } on PlatformException catch (e) {
           if (run.pressureStopped) return;
           if (run.cancelled) return;
+          CrashGuard.log('Akış hatası', '${_brief(e)} (deneme ${attempt + 1})', null);
           if (run.emitted > 0)
             rethrow; // kısmi çıktı varsa yeniden denemek çıktıyı bozar
           if (e.code != 'NO_EVENT_SINK') {
@@ -1131,14 +1212,18 @@ class LlamaEngine implements LlmEngine {
           await Future<void>.delayed(_retryDelay);
           await _quiesceNative();
           if (attempt == 0) continue;
-          _streamingUnsupported = true;
+          _dropStreaming(e.code, e.message);
           break;
+        } on Object catch (e) {
+          if (!run.cancelled) CrashGuard.log('Akış hatası', _brief(e), null);
+          rethrow;
         }
       }
     }
     if (run.cancelled || run.pressureStopped) return;
     if (attemptedStream) await _quiesceNative();
     if (run.pressureStopped) return;
+    _setFallback(true);
     final String text;
     try {
       text = await _backend.complete(prompt, maxTokens);
@@ -1160,6 +1245,8 @@ class LlamaEngine implements LlmEngine {
     await _emitText(run, c, text);
   }
 
+  /// Akışsız yolda hazır metni parça parça yayar. Arayüzdeki yazı animasyonu (TypewriterText) harf harf
+  /// göstermeyi üstlendiği için burada yapay bekleme yok: yalnızca olay-döngüsü turu (iptal kontrolü için).
   Future<void> _emitText(
     _GenRun run,
     StreamController<String> c,
@@ -1199,6 +1286,7 @@ class LlamaEngine implements LlmEngine {
         await _quiesceNative();
         if (run.cancelled) return;
         CrashGuard.log('Kurtarma (a)', 'akışsız complete() deneniyor', null);
+        _setFallback(true);
         final text = await _backend.complete(prompt, maxTokens);
         CrashGuard.log('Kurtarma (a)', 'başarılı', null);
         await _emitText(run, c, text);

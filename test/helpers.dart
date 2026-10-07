@@ -1,6 +1,8 @@
+// Değişiklik: FakeEngine'e tokenDelay + fallback (akışsız yedek benzetimi, StreamStatusSource); FakeBackend.streamError değiştirilebilir.
 import 'dart:async';
 import 'dart:io';
 
+import 'package:flutter/foundation.dart' show ValueListenable, ValueNotifier;
 import 'package:flutter/services.dart';
 import 'package:kripton_ai/data/default_data.dart';
 import 'package:kripton_ai/data/file_service.dart';
@@ -10,7 +12,7 @@ import 'package:kripton_ai/data/storage.dart';
 import 'package:kripton_ai/domain/entities.dart';
 
 /// Runner/controller testleri için sahte motor.
-class FakeEngine implements LlmEngine {
+class FakeEngine implements LlmEngine, StreamStatusSource {
   FakeEngine({
     this.tokens = const [
       'Merhaba dünya. Bu sahte çıktı, ajan kabul kapısının gerektirdiği uzunlukta bir test metnidir.',
@@ -21,7 +23,20 @@ class FakeEngine implements LlmEngine {
     this.batchSize,
     this.responder,
     this.ctx,
+    this.tokenDelay = const Duration(milliseconds: 5),
+    this.fallback = false,
   });
+
+  /// Her token öncesi bekleme (yavaş akış benzetimi için büyütülür).
+  Duration tokenDelay;
+
+  /// true: canlı akış yok; tüm metin tek parça ve geç gelir (LlamaEngine'in complete() yedeğine benzer)
+  /// ve [streamFallback] üretim boyunca true olur.
+  bool fallback;
+  final ValueNotifier<bool> _fb = ValueNotifier<bool>(false);
+
+  @override
+  ValueListenable<bool> get streamFallback => _fb;
 
   List<String> tokens;
 
@@ -89,10 +104,18 @@ class FakeEngine implements LlmEngine {
             return;
           }
         }
-        for (final t in toks) {
-          await Future<void>.delayed(const Duration(milliseconds: 5));
+        if (fallback) {
+          _fb.value = true;
+          await Future<void>.delayed(tokenDelay);
           if (cancelled) return;
-          c.add(t);
+          c.add(toks.join());
+        } else {
+          _fb.value = false;
+          for (final t in toks) {
+            await Future<void>.delayed(tokenDelay);
+            if (cancelled) return;
+            c.add(t);
+          }
         }
         if (hangOnCall != call && !cancelled) await c.close();
       },
@@ -137,7 +160,7 @@ class FakeBackend implements LlamaBackend {
   });
 
   final List<String> streamTokens;
-  final Object? streamError;
+  Object? streamError;
 
   /// true: önce [streamTokens] gelir, sonra [streamError] fırlatılır (kısmi çıktı).
   final bool errorAfterTokens;

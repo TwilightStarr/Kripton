@@ -1,3 +1,4 @@
+// Değişiklik: yazı akışı testleri eklendi (yavaş token → artımlı draft, yedek mod bayrağı, çift balon yok, Durdur görünen kısmı kaydeder, re-entrancy, chatTypeMode ayarı).
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
@@ -12,6 +13,7 @@ import 'package:kripton_ai/application/engine_lock.dart';
 import 'package:kripton_ai/application/settings_controller.dart';
 import 'package:kripton_ai/data/chat_store.dart';
 import 'package:kripton_ai/domain/chat_models.dart';
+import 'package:kripton_ai/domain/chat_type_mode.dart';
 import 'package:kripton_ai/domain/entities.dart';
 import 'package:kripton_ai/domain/start_screen.dart';
 
@@ -418,6 +420,108 @@ void main() {
       addTearDown(c.dispose);
       c.read(settingsProvider.notifier).setChatAutoPrepare(false);
       expect(c.read(settingsProvider).chatAutoPrepare, isFalse);
+    });
+  });
+
+  group('yazı akışı ve geçiş', () {
+    test('1) tokenlar yavaş gelince draft artımlı büyür (tek seferde "tak" yok)', () async {
+      final c = await boot(
+        e: FakeEngine(
+          ctx: 4096,
+          tokens: const ['Mer', 'haba', ' dün', 'ya'],
+          tokenDelay: const Duration(milliseconds: 120),
+        ),
+      );
+      final drafts = <String>[];
+      container.listen<ChatState>(chatProvider, (p, n) {
+        if (n.draft.isNotEmpty && (drafts.isEmpty || drafts.last != n.draft)) drafts.add(n.draft);
+      });
+      await c.send('Selam');
+      expect(drafts.length, greaterThanOrEqualTo(3), reason: 'draft parça parça büyümeli: $drafts');
+      expect(drafts.first, 'Mer');
+      for (var i = 1; i < drafts.length; i++) {
+        expect(drafts[i].startsWith(drafts[i - 1]), isTrue);
+        expect(drafts[i].length, greaterThan(drafts[i - 1].length));
+      }
+      expect(container.read(chatProvider).messages.last.text, 'Merhaba dünya');
+    });
+
+    test('2) akış yedeğe düşünce: bayrak üretim boyunca açık, metin tek parça gelir, sonra bayrak kapanır', () async {
+      const text = 'Canlı akış yok; bu yanıt hazır olunca tek parça geldi.';
+      final c = await boot(
+        e: FakeEngine(ctx: 4096, tokens: const [text], fallback: true, tokenDelay: const Duration(milliseconds: 60)),
+      );
+      final drafts = <String>[];
+      var sawFallback = false;
+      container.listen<ChatState>(chatProvider, (p, n) {
+        if (n.streamFallback) sawFallback = true;
+        if (n.draft.isNotEmpty && (drafts.isEmpty || drafts.last != n.draft)) drafts.add(n.draft);
+      });
+      await c.send('Selam');
+      expect(sawFallback, isTrue);
+      expect(drafts, [text], reason: 'yedek yolda metin tek seferde gelir; harf harf gösterim arayüz animasyonunun işi');
+      expect(container.read(chatProvider).streamFallback, isFalse);
+      expect(container.read(chatProvider).messages.last.text, text);
+    });
+
+    test('4) üretim bitince çift balon yok: canlı balon ile kalıcı mesaj aynı state güncellemesinde el değiştirir', () async {
+      final c = await boot(
+        e: FakeEngine(ctx: 4096, tokens: const ['Tamam', ', anladım'], tokenDelay: const Duration(milliseconds: 100)),
+      );
+      final states = <ChatState>[];
+      container.listen<ChatState>(chatProvider, (p, n) => states.add(n));
+      await c.send('Merhaba');
+      for (final st in states) {
+        final lastIsAssistant = st.messages.isNotEmpty && st.messages.last.role == ChatRole.assistant;
+        expect(
+          st.generating && lastIsAssistant,
+          isFalse,
+          reason: 'canlı balon (generating) ile kalıcı yanıt aynı karede görünmemeli',
+        );
+        expect(lastIsAssistant && st.draft.isNotEmpty, isFalse, reason: 'kalıcı yanıtla birlikte draft kalmamalı');
+      }
+      final handoff = states.where((st) => st.messages.isNotEmpty && st.messages.last.role == ChatRole.assistant).first;
+      expect(handoff.generating, isFalse);
+      expect(handoff.draft, isEmpty);
+      expect(handoff.phase, isEmpty);
+      expect(handoff.settleId, handoff.messages.last.id);
+    });
+
+    test('5) Durdur: yalnızca ekranda görünen kısım kaydedilir', () async {
+      final c = await boot(e: FakeEngine(ctx: 4096, tokens: const ['Merhaba dünya nasılsın'], hangOnCall: 1));
+      final fut = c.send('Anlat');
+      for (var i = 0; i < 200 && container.read(chatProvider).draft.isEmpty; i++) {
+        await Future<void>.delayed(const Duration(milliseconds: 10));
+      }
+      expect(container.read(chatProvider).draft, 'Merhaba dünya nasılsın');
+      await c.stop(visibleChars: 7); // animasyon "Merhaba"ya kadar göstermişti
+      await fut;
+      final s = container.read(chatProvider);
+      expect(s.generating, isFalse);
+      expect(s.messages.last.text, 'Merhaba\n\n[durduruldu]');
+    });
+
+    test('yeniden giriş: art arda iki send yalnızca bir yanıt üretir', () async {
+      final c = await boot();
+      final f1 = c.send('Birinci');
+      final f2 = c.send('İkinci');
+      await Future.wait([f1, f2]);
+      expect(engine.generateCalls, 1);
+      final users = container.read(chatProvider).messages.where((m) => m.role == ChatRole.user).toList();
+      expect(users.map((m) => m.text), ['Birinci']);
+    });
+
+    test('chatTypeMode: varsayılan harf; JSON gidiş-dönüş; eski/bozuk kayıt harfe düşer', () {
+      expect(const AppSettings().chatTypeMode, ChatTypeMode.letter);
+      expect(AppSettings.fromJson({}).chatTypeMode, ChatTypeMode.letter);
+      expect(AppSettings.fromJson({'chatTypeMode': 'bilinmeyen'}).chatTypeMode, ChatTypeMode.letter);
+      for (final m in ChatTypeMode.values) {
+        expect(AppSettings.fromJson(AppSettings(chatTypeMode: m).toJson()).chatTypeMode, m);
+      }
+      final c = ProviderContainer();
+      addTearDown(c.dispose);
+      c.read(settingsProvider.notifier).setChatTypeMode(ChatTypeMode.word);
+      expect(c.read(settingsProvider).chatTypeMode, ChatTypeMode.word);
     });
   });
 }
