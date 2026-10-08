@@ -1274,9 +1274,10 @@ class AppController extends Notifier<AppState> {
             );
             _devSet((d) => d.copyWith(fixedTotal: fixedTotal));
           }
-          if (prevOutput != null) {
+          final prevZip = prevOutput;
+          if (prevZip != null) {
             try {
-              await File(prevOutput!).delete(); // yalnızca bizim ürettiğimiz ara ZIP silinir
+              await File(prevZip).delete(); // yalnızca bizim ürettiğimiz ara ZIP silinir
             } catch (_) {}
           }
           prevOutput = outPath;
@@ -1606,9 +1607,10 @@ class AppController extends Notifier<AppState> {
             );
             _devSet((d) => d.copyWith(fixedTotal: fixedTotal));
           }
-          if (prevOutput != null) {
+          final prevZip = prevOutput; // kapanışta da değiştirildiği için yerel kopya (null-promotion)
+          if (prevZip != null) {
             try {
-              await File(prevOutput).delete(); // yalnızca bizim ürettiğimiz ara ZIP silinir
+              await File(prevZip).delete(); // yalnızca bizim ürettiğimiz ara ZIP silinir
             } catch (_) {}
           }
           prevOutput = outPath;
