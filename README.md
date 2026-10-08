@@ -4,8 +4,10 @@
 
 Kripton, Android için geliştirilmiş bir Flutter uygulamasıdır. GGUF biçimindeki dil modellerini
 doğrudan cihazda çalıştırır ([llama.cpp](https://github.com/ggml-org/llama.cpp) tabanlı
-`flutter_llama` ile); bulut API'si, hesap veya abonelik gerektirmez. Modelleri bir kez indirdikten sonra
-tüm üretim, sohbet ve kod geliştirme işleri çevrimdışı yapılır.
+`flutter_llama` ile); hesap veya abonelik gerektirmez. Modelleri bir kez indirdikten sonra
+tüm üretim, sohbet ve kod geliştirme işleri çevrimdışı yapılır. **İsteğe bağlı:** Gemini, Groq ve OpenRouter için
+kendi (ücretsiz) API anahtarını girerek çok daha güçlü **bulut motorlarını** da kullanabilirsin
+([Bulut motorları](#bulut-motorları)).
 
 > **Durum:** Aktif geliştirilen, deneysel bir projedir. Yerel 7B sınıfı modellerin kalitesi sınırlıdır;
 > ayrıntılar için [Bilinen sınırlamalar](#bilinen-sınırlamalar) bölümüne bakın.
@@ -21,6 +23,7 @@ tüm üretim, sohbet ve kod geliştirme işleri çevrimdışı yapılır.
 - [Kurulum](#kurulum)
 - [Derleme (CI)](#derleme-ci)
 - [Bellek, kararlılık ve arka plan](#bellek-kararlılık-ve-arka-plan)
+- [Bulut motorları](#bulut-motorları)
 - [Gizlilik ve izinler](#gizlilik-ve-izinler)
 - [Proje yapısı](#proje-yapısı)
 - [Test](#test)
@@ -87,6 +90,24 @@ incelenene kadar otomatik sürer.
 
 Yamalar güvenlik denetiminden geçer: yalnızca gösterilen dosyalar değişebilir, yeni dosyalar yalnızca `lib/` ve `test/`
 altında `.dart` olabilir, büyük silmeler reddedilir ve yama sonrası yapı bozulursa dosya geri alınır.
+
+#### Otonom mod (24 saate kadar)
+
+Geliştirme Modu'nda **"Kendi kendine çalış ve hatayı düzelt"** açılırsa tur sayısı yok sayılır ve oturum
+en çok 1/6/12/24 saat sürer:
+
+- Proje baştan sona tekrar tekrar gezilir; her parçada 1. AI'nın raporuna ek olarak **yerel denetim**
+  (parantez dengesi, kısaltılmış içerik, olmayan import) kesin bulguları 2. AI'ya iletir.
+- **Kendi kendine toparlanma:** model geçerli çıktı üretemezse 30 sn → 10 dk üstel bekleme ile yeniden denenir
+  (en çok 8 ardışık başarısızlık); telefon çok ısınırsa (termal SEVERE+) soğuması beklenir.
+- **Kararlılık:** iki ardışık temiz tam geçişte proje "kararlı" sayılır. Bir **hedef** yazıldıysa bu noktada
+  hedef doğrultusunda geliştirme aşamasına geçilir; hedef için de yeni öneri kalmayınca oturum biter.
+- **Kontrol noktası:** her turdan sonra `autopilot.json` yazılır. Uygulama kapanır/öldürülürse Geliştirme Modu
+  ekranında **"Kaldığı yerden devam et"** çıkar (süre ve sayaçlar korunur). Kullanıcı iptal ederse kontrol noktası silinir.
+- Oturum boyunca ön plan servisi ve ekran uyanık kalma kilidi açıktır; şarja takılı bırakılması önerilir.
+
+> Yerel modeller yanılabilir. Otonom mod çalışan kodu bozan yamaları (denge, import, büyük silme) reddeder, ancak tür ve
+> çalışma zamanı hatalarını yakalamaz; çıkan ZIP'i `flutter analyze` ve `flutter test` ile doğrulayın.
 
 ### 4. Sohbet
 
@@ -201,14 +222,40 @@ Yerel modeller telefonlarda bellek baskısıyla karşılaşır. Kripton bunu şu
 
 ---
 
+## Bulut motorları
+
+Geliştirme Modu → **3. HANGİ AI?** kartındaki **Bulut ayarları** düğmesinden açılır. Yerel modeller varsayılan olarak
+kalır; bulut yalnızca sen seçersen kullanılır.
+
+- **Sağlayıcılar:** Google Gemini, Groq, OpenRouter. Her biri için kendi API anahtarını gir (Gemini: Google AI Studio,
+  Groq: console.groq.com, OpenRouter: openrouter.ai). Model adları düzenlenebilir; sağlayıcılar adları değiştirebilir.
+- **Otomatik yedek:** `Bulut: Otomatik` seçilince sıra (varsayılan Gemini → Groq → OpenRouter) kullanılır. Bir sağlayıcı
+  kota (429), anahtar, model veya sunucu hatası verirse bir süre dinlendirilir ve sıradaki sağlayıcı denenir; hepsi
+  doluysa en çok 25 dk beklenir (iptal edilebilir). Akış yarıda kesilirse çıktı karışmasın diye başka sağlayıcıya geçilmez,
+  üst katman turu yeniden dener.
+- **Hibrit (önce yerel, sonra bulut):** Otonom modda iş yerel modellerle yürür. (1) Yerel model art arda iki tur geçerli
+  çıktı/yama üretemezse sonraki 3 tur bulutla çalışır; (2) yerel modellerde proje kararlı olunca (ve hedef iyileştirmesi
+  bitince) bulut modelleri projeyi baştan sona **son bir doğrulama geçişiyle** tarar ve düzeltir; (3) süre dolmadan
+  ~%14'ü (en çok 30 dk) kala bu son geçiş zorla başlatılır. Çıktı her turda güncellenen ZIP'tir. Bulut ayarlarından kapatılabilir;
+  anahtar girilmediyse davranış eskisi gibi tamamen yereldir.
+- **Web araştırması:** Otonom modda bir **hedef** yazıldıysa, hedef doğrultusunda geliştirmeye geçerken Gemini + Google
+  Arama ile kısa bir araştırma notu alınır ve geliştirme önerilerine eklenir (Gemini anahtarı gerekir; kapatılabilir).
+- **Sınırlar:** Ücretsiz katman kotaları ve kuralları sağlayıcıya göre değişir ve sık değişir. Bağlam penceresi bilinçli
+  olarak 24K token ile sınırlıdır. Hız için istekler arasına kısa aralıklar konur.
+- **Güvenlik:** Anahtarlar `cloud_config.json` içinde uygulamanın özel klasöründe düz metin saklanır; Android yedekleme
+  davranışına dikkat et. Bulut modeli seçildiğinde istemler (proje kodu dahil) ilgili sağlayıcıya gönderilir.
+
+---
+
 ## Gizlilik ve izinler
 
 - Sohbetler, belgeler, hafıza dosyaları ve üretilen çıktılar **yalnızca cihazda** saklanır.
-- Uygulama yalnızca model dosyalarını indirmek için ağa bağlanır (Hugging Face). Telemetri paneli tamamen yereldir.
+- Varsayılan olarak uygulama yalnızca model dosyalarını indirmek için ağa bağlanır (Hugging Face). Bulut motoru seçersen
+  istemler (kod dahil) seçtiğin sağlayıcıya gönderilir. Telemetri paneli tamamen yereldir.
 
 | İzin | Neden |
 |---|---|
-| `INTERNET`, `ACCESS_NETWORK_STATE` | Model indirme |
+| `INTERNET`, `ACCESS_NETWORK_STATE` | Model indirme ve (isteğe bağlı) bulut motorları |
 | `FOREGROUND_SERVICE`, `FOREGROUND_SERVICE_DATA_SYNC` | İndirme ve üretimin arka planda sürmesi |
 | `POST_NOTIFICATIONS` | İndirme/üretim bildirimi |
 | `WAKE_LOCK` | Uzun üretimlerde cihazın uyumaması |
@@ -247,7 +294,7 @@ flutter analyze
 flutter test
 ```
 
-`test/` altında 27 test dosyasında, gerçek model yerine sahte motor kullanan birim ve uçtan uca testler bulunur
+`test/` altında 28 test dosyasında, gerçek model yerine sahte motor kullanan birim ve uçtan uca testler bulunur
 (doğrulayıcı, akış çalıştırıcı, bütçe, bellek planı, indirme doğrulama, sohbet hafızası, geliştirme modu vb.).
 Sahte motorlu testler model kalitesini veya gerçek cihaz davranışını ölçmez.
 
@@ -269,3 +316,16 @@ Sahte motorlu testler model kalitesini veya gerçek cihaz davranışını ölçm
   henüz akışlara veya arayüze bağlanmamıştır.
 - **Donanım:** Yalnızca `arm64-v8a` desteklenir, çıkarım CPU üzerinde yapılır (GPU/Vulkan yoktur). Sade Mod'un kazancı
   arayüz tarafıyla sınırlıdır; modelin kendi RAM kullanımı değişmez.
+
+## Flutter modu (GitHub Actions ile gerçek analyze / derleme)
+
+Geliştirme Modu'nda **Flutter modu** açılınca proje, ayrı bir dala (varsayılan `kripton-ci`) tek commit olarak
+gönderilir; Actions'ta sırayla `flutter pub get`, `flutter analyze`, `flutter test` ve `flutter build apk --debug`
+çalışır. Başarısız aşamanın çıktısı **kırpılmadan** 2. AI'ya verilir; bağlama sığmayan çıktı satır sınırlarında
+kayıpsız parçalara bölünür. Otonom modda proje, GitHub'da temiz geçmeden "kararlı" sayılmaz; ağ/kota/iptal
+durumlarında üstel geri çekilmeyle beklenir ve yeniden denenir.
+
+- Token: classic için `repo` + `workflow`; fine-grained için Contents RW, Actions R, Workflows RW.
+- Depoda en az bir commit olmalı. `main` dalına dokunulmaz; kontrol dalı her seferinde sıfırdan yazılır.
+- Projede `tool/ci_prebuild.sh` varsa derlemeden önce çalıştırılır (ör. llama.cpp kaynağını çekmek için).
+- `flutter analyze` bilgi (info) düzeyi notlar düzeltmeye gönderilmez; hata ve uyarılar gönderilir.

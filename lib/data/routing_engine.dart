@@ -1,30 +1,34 @@
 // Değişiklik: yeni dosya. Uzantıya göre LlamaEngine / LiteRtEngine seçen yönlendirici.
 import 'package:flutter/foundation.dart' show ValueListenable, ValueNotifier;
 
+import 'cloud_engine.dart';
 import 'crash_guard.dart';
 import 'litert_engine.dart';
 import 'litert_runtime.dart';
 import 'llm_engine.dart';
 
-enum EngineKind { llama, litert }
+enum EngineKind { llama, litert, cloud }
 
 /// .litertlm / .task -> LiteRT-LM. Diğer her şey (.gguf dahil) -> llama.cpp; böylece GGUF yolu eskisi gibi
 /// kalır (uzantısı farklı adlandırılmış GGUF'u LlamaEngine kendi başlık denetimiyle ele alır).
 EngineKind engineKindForPath(String path) {
   final p = path.toLowerCase();
+  if (isCloudPath(p)) return EngineKind.cloud;
   if (p.endsWith('.litertlm') || p.endsWith('.task')) return EngineKind.litert;
   return EngineKind.llama;
 }
 
 class RoutingEngine implements LlmEngine, StreamStatusSource, BackendReporter {
-  RoutingEngine({LlmEngine? llama, LlmEngine? litert})
+  RoutingEngine({LlmEngine? llama, LlmEngine? litert, LlmEngine? cloud})
       : _llama = llama ?? LlamaEngine(),
-        _litert = litert ?? LiteRtEngine() {
+        _litert = litert ?? LiteRtEngine(),
+        _cloud = cloud ?? CloudEngine() {
     _bindFallback(_llama);
   }
 
   final LlmEngine _llama;
   final LlmEngine _litert;
+  final LlmEngine _cloud;
   final EngineGate _gate = EngineGate();
 
   LlmEngine? _active;
@@ -58,6 +62,7 @@ class RoutingEngine implements LlmEngine, StreamStatusSource, BackendReporter {
   String? get activeEngineName => switch (_activeKind) {
         EngineKind.llama => 'llama.cpp',
         EngineKind.litert => 'LiteRT-LM',
+        EngineKind.cloud => 'Bulut',
         null => null,
       };
 
@@ -89,7 +94,11 @@ class RoutingEngine implements LlmEngine, StreamStatusSource, BackendReporter {
   @override
   Future<void> ensureLoaded(String path, {int? expectedBytes}) => _gate.run(() async {
         final kind = engineKindForPath(path);
-        final target = kind == EngineKind.litert ? _litert : _llama;
+        final target = switch (kind) {
+          EngineKind.litert => _litert,
+          EngineKind.cloud => _cloud,
+          EngineKind.llama => _llama,
+        };
         final current = _active;
         if (current != null && !identical(current, target)) {
           // Aynı anda ikisi RAM'de olmasın: ESKİ motor önce boşaltılır.
@@ -101,7 +110,8 @@ class RoutingEngine implements LlmEngine, StreamStatusSource, BackendReporter {
         await target.ensureLoaded(path, expectedBytes: expectedBytes);
       });
 
-  String _nameOf(LlmEngine e) => identical(e, _llama) ? 'llama.cpp' : 'LiteRT-LM';
+  String _nameOf(LlmEngine e) =>
+      identical(e, _llama) ? 'llama.cpp' : (identical(e, _cloud) ? 'Bulut' : 'LiteRT-LM');
 
   Future<void> _unloadEngine(LlmEngine e) async {
     if (e.loadedPath == null) return;
@@ -125,6 +135,6 @@ class RoutingEngine implements LlmEngine, StreamStatusSource, BackendReporter {
   Future<void> dispose() async {
     _fbSource?.removeListener(_mirror);
     _fbSource = null;
-    await Future.wait<void>([_llama.dispose(), _litert.dispose()]);
+    await Future.wait<void>([_llama.dispose(), _litert.dispose(), _cloud.dispose()]);
   }
 }

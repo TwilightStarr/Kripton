@@ -5,11 +5,15 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:open_filex/open_filex.dart';
 
 import '../application/app_controller.dart';
+import '../application/autopilot.dart';
 import '../application/dev_mode.dart';
 import '../core/theme.dart';
+import '../data/cloud_engine.dart' show CloudConfig;
+import '../data/github_ci.dart' show GithubCiConfig;
 import '../domain/entities.dart';
 import 'cancel_dialog.dart';
 import 'chat_page.dart';
+import 'cloud_settings_sheet.dart';
 import 'home_page.dart';
 import 'live_status.dart';
 import 'model_manager_page.dart';
@@ -42,7 +46,15 @@ class DevModePage extends ConsumerStatefulWidget {
 
 class _DevModePageState extends ConsumerState<DevModePage> {
   final _rounds = TextEditingController(text: '3');
+  final _goal = TextEditingController();
+  final _ghRepo = TextEditingController();
+  final _ghToken = TextEditingController();
+  final _ghBranch = TextEditingController(text: 'kripton-ci');
+  bool _flutterCi = false;
   bool _coverAll = false;
+  bool _auto = false;
+  int _hours = 24;
+  AutopilotCheckpoint? _pending;
   String? _zipPath;
   String _zipName = '';
   int _zipSize = 0;
@@ -50,8 +62,47 @@ class _DevModePageState extends ConsumerState<DevModePage> {
   String? _fixerId;
 
   @override
+  void initState() {
+    super.initState();
+    _loadPending();
+    _loadGithub();
+  }
+
+  Future<void> _loadGithub() async {
+    final g = GithubCiConfig.instance;
+    await g.load();
+    if (!mounted) return;
+    setState(() {
+      _ghRepo.text = g.repo;
+      _ghToken.text = g.token;
+      _ghBranch.text = g.branch;
+    });
+  }
+
+  /// Alanlardaki GitHub ayarlarını kalıcı yapılandırmaya yazar.
+  Future<void> _saveGithub() async {
+    final g = GithubCiConfig.instance;
+    g.repo = _ghRepo.text.trim();
+    g.token = _ghToken.text.trim();
+    final b = _ghBranch.text.trim();
+    g.branch = b.isEmpty ? 'kripton-ci' : b;
+    await g.save();
+  }
+
+  /// Önceki oturumdan (ör. süreç öldürüldü) kalan otonom oturum var mı?
+  Future<void> _loadPending() async {
+    final cp = await ref.read(appProvider.notifier).pendingAutopilot();
+    if (!mounted) return;
+    setState(() => _pending = cp);
+  }
+
+  @override
   void dispose() {
     _rounds.dispose();
+    _goal.dispose();
+    _ghRepo.dispose();
+    _ghToken.dispose();
+    _ghBranch.dispose();
     super.dispose();
   }
 
@@ -103,13 +154,16 @@ class _DevModePageState extends ConsumerState<DevModePage> {
     final analystId = cachedIds.contains(_analystId) ? _analystId : _defaultId(s);
     final fixerId = cachedIds.contains(_fixerId) ? _fixerId : _defaultId(s);
     final rounds = _roundCount;
+    final ghUsable = RegExp(r'^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$').hasMatch(_ghRepo.text.trim()) &&
+        _ghToken.text.trim().isNotEmpty;
     final canStart =
         !s.running &&
         !s.cancelling &&
         _zipPath != null &&
-        (_coverAll || rounds != null) &&
+        (_auto || _coverAll || rounds != null) &&
         analystId != null &&
-        fixerId != null;
+        fixerId != null &&
+        (!_flutterCi || ghUsable);
     final dev = s.dev;
 
     return Scaffold(
@@ -176,6 +230,162 @@ class _DevModePageState extends ConsumerState<DevModePage> {
                 ),
               ),
               const SizedBox(height: 12),
+              if (_pending != null && !s.running) ...[
+                _card(
+                  title: 'YARIM KALAN OTONOM OTURUM',
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Text(
+                        '${_pending!.round}. turda kesildi · ${_pending!.fixedTotal} düzeltme · '
+                        'kalan süre ${autopilotDurationText(_pending!.remaining(DateTime.now()))}.',
+                        style: const TextStyle(fontSize: 12.5),
+                      ),
+                      const SizedBox(height: 8),
+                      Row(
+                        children: [
+                          FilledButton.icon(
+                            onPressed: () {
+                              final cp = _pending!;
+                              setState(() => _pending = null);
+                              c.resumeAutopilot(cp);
+                            },
+                            icon: const Icon(Icons.play_arrow),
+                            label: const Text('Kaldığı yerden devam et'),
+                          ),
+                          const SizedBox(width: 8),
+                          TextButton(
+                            onPressed: () async {
+                              await c.discardAutopilot();
+                              if (mounted) setState(() => _pending = null);
+                            },
+                            child: const Text('Vazgeç'),
+                          ),
+                        ],
+                      ),
+                    ],
+                  ),
+                ),
+                const SizedBox(height: 12),
+              ],
+              _card(
+                title: 'OTONOM MOD (24 SAATE KADAR)',
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    SwitchListTile(
+                      contentPadding: EdgeInsets.zero,
+                      dense: true,
+                      title: const Text('Kendi kendine çalış ve hatayı düzelt', style: TextStyle(fontSize: 13)),
+                      subtitle: Text(
+                        'Tur sayısını yok sayar. Proje hata kalmayana kadar tekrar tekrar gezilir; model hata verirse '
+                        'bekleyip yeniden dener, telefon ısınırsa soğumasını bekler, her turdan sonra kaldığı yer '
+                        'kaydedilir (uygulama kapansa bile devam edilebilir). Şarja takıp ekranı açık bırak.',
+                        style: TextStyle(fontSize: 11, color: KColors.muted),
+                      ),
+                      value: _auto,
+                      onChanged: s.running ? null : (v) => setState(() => _auto = v),
+                    ),
+                    if (_auto) ...[
+                      const SizedBox(height: 6),
+                      Wrap(
+                        spacing: 8,
+                        children: [
+                          for (final h in const [1, 6, 12, 24])
+                            ChoiceChip(
+                              label: Text('$h sa'),
+                              selected: _hours == h,
+                              onSelected: s.running ? null : (_) => setState(() => _hours = h),
+                            ),
+                        ],
+                      ),
+                      const SizedBox(height: 8),
+                      TextField(
+                        controller: _goal,
+                        enabled: !s.running,
+                        maxLines: 3,
+                        minLines: 1,
+                        style: const TextStyle(fontSize: 13),
+                        decoration: const InputDecoration(
+                          labelText: 'Hedef (isteğe bağlı)',
+                          hintText: 'Hata kalmayınca neyi geliştirsin? Örn: ayarlar ekranı ekle, hata mesajlarını Türkçeleştir',
+                          border: OutlineInputBorder(),
+                        ),
+                      ),
+                    ],
+                  ],
+                ),
+              ),
+              const SizedBox(height: 12),
+              _card(
+                title: 'FLUTTER MODU (GITHUB ACTIONS)',
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    SwitchListTile(
+                      contentPadding: EdgeInsets.zero,
+                      dense: true,
+                      title: const Text('Gerçek flutter analyze / test / derleme', style: TextStyle(fontSize: 13)),
+                      subtitle: Text(
+                        'Proje GitHub\'a (ayrı bir dala) gönderilir; Actions\'ta flutter pub get, analyze, test ve '
+                        'derleme çalışır. Hata çıktısı kırpılmadan 2. AI\'ya verilir (uzunsa kayıpsız parçalara bölünür). '
+                        'Otonom modda proje, GitHub\'da temiz geçmeden kararlı sayılmaz. Depoda en az bir commit olmalı.',
+                        style: TextStyle(fontSize: 11, color: KColors.muted),
+                      ),
+                      value: _flutterCi,
+                      onChanged: s.running ? null : (v) => setState(() => _flutterCi = v),
+                    ),
+                    if (_flutterCi) ...[
+                      const SizedBox(height: 6),
+                      TextField(
+                        controller: _ghRepo,
+                        enabled: !s.running,
+                        style: const TextStyle(fontSize: 13),
+                        onChanged: (_) {
+                          setState(() {});
+                          _saveGithub();
+                        },
+                        decoration: const InputDecoration(
+                          labelText: 'Depo (sahip/depo)',
+                          hintText: 'kullanici/Kripton-Deneme',
+                          border: OutlineInputBorder(),
+                        ),
+                      ),
+                      const SizedBox(height: 8),
+                      TextField(
+                        controller: _ghToken,
+                        enabled: !s.running,
+                        obscureText: true,
+                        autocorrect: false,
+                        enableSuggestions: false,
+                        style: const TextStyle(fontSize: 13),
+                        onChanged: (_) {
+                          setState(() {});
+                          _saveGithub();
+                        },
+                        decoration: const InputDecoration(
+                          labelText: 'GitHub token',
+                          helperText: 'classic: repo + workflow  |  fine-grained: Contents RW, Actions R, Workflows RW',
+                          border: OutlineInputBorder(),
+                        ),
+                      ),
+                      const SizedBox(height: 8),
+                      TextField(
+                        controller: _ghBranch,
+                        enabled: !s.running,
+                        style: const TextStyle(fontSize: 13),
+                        onChanged: (_) => _saveGithub(),
+                        decoration: const InputDecoration(
+                          labelText: 'Kontrol dalı (her seferinde sıfırdan yazılır)',
+                          border: OutlineInputBorder(),
+                        ),
+                      ),
+                    ],
+                  ],
+                ),
+              ),
+              const SizedBox(height: 12),
+              if (!_auto)
               _card(
                 title: '2. KAÇ TUR?',
                 child: Column(
@@ -301,8 +511,22 @@ class _DevModePageState extends ConsumerState<DevModePage> {
                           const SizedBox(height: 8),
                           Text(
                             'İpucu: ikisi için de talimat uyan bir model (Qwen) seç. DeepSeek R1 akıl yürütme modelidir; '
-                            'çıktı bütçesini düşünmeye harcayıp boş yanıt verebilir.',
+                            'çıktı bütçesini düşünmeye harcayıp boş yanıt verebilir. '
+                            '"Bulut" modelleri (Gemini/Groq/OpenRouter) çok daha güçlüdür; API anahtarı gerekir.',
                             style: TextStyle(fontSize: 11.5, color: KColors.muted, height: 1.35),
+                          ),
+                          const SizedBox(height: 8),
+                          OutlinedButton.icon(
+                            onPressed: s.running
+                                ? null
+                                : () async {
+                                    await showCloudSettingsSheet(context);
+                                    if (mounted) setState(() {});
+                                  },
+                            icon: const Icon(Icons.cloud_outlined, size: 16),
+                            label: Text(
+                              CloudConfig.instance.anyUsable ? 'Bulut ayarları (anahtar girildi)' : 'Bulut ayarları (anahtar yok)',
+                            ),
                           ),
                         ],
                       ),
@@ -326,6 +550,10 @@ class _DevModePageState extends ConsumerState<DevModePage> {
                                   analystModelId: analystId!,
                                   fixerModelId: fixerId!,
                                   coverAll: _coverAll,
+                                  autonomous: _auto,
+                                  goal: _goal.text.trim(),
+                                  maxDuration: Duration(hours: _hours),
+                                  flutterCi: _flutterCi,
                                 ),
                               )
                             : null,
@@ -410,14 +638,26 @@ class _DevModePageState extends ConsumerState<DevModePage> {
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
           Text(
-            dev.active
+            dev.autonomous
+                ? (dev.active
+                      ? 'Otonom · Tur ${dev.round} · ${dev.phase}'
+                      : '${dev.phase} · ${dev.fixedTotal} düzeltme')
+                : dev.active
                 ? 'Tur ${dev.round}/${dev.total} · ${dev.phase}'
                 : '${dev.phase} · $done/${dev.total} tur, ${dev.fixedRounds} turda düzeltme',
             style: const TextStyle(fontSize: 13, fontWeight: FontWeight.w700),
           ),
+          if (dev.autonomous && dev.active) ...[
+            const SizedBox(height: 4),
+            Text(
+              'Kalan süre: ${autopilotDurationText(Duration(milliseconds: (dev.deadlineMs - DateTime.now().millisecondsSinceEpoch).clamp(0, 86400000)))}'
+              ' · ${dev.fixedTotal} düzeltme · ${dev.improving ? 'hedef geliştirme aşaması' : 'hata arama aşaması'}',
+              style: TextStyle(fontSize: 11.5, color: KColors.muted),
+            ),
+          ],
           const SizedBox(height: 8),
           LinearProgressIndicator(
-            value: dev.total == 0 ? null : (done / dev.total).clamp(0.0, 1.0),
+            value: (dev.total == 0 || dev.autonomous) ? null : (done / dev.total).clamp(0.0, 1.0),
             color: KColors.accent,
             backgroundColor: KColors.border,
             minHeight: 5,

@@ -8,6 +8,9 @@ import 'package:wakelock_plus/wakelock_plus.dart';
 
 import '../data/default_data.dart';
 import '../data/file_service.dart';
+import '../data/flutter_project_check.dart' show ProjectProblem;
+import '../data/github_ci.dart';
+import '../data/cloud_engine.dart';
 import '../data/llm_engine.dart';
 import '../data/model_downloader.dart';
 import '../data/native_services.dart';
@@ -19,6 +22,8 @@ import '../data/storage.dart';
 import '../domain/entities.dart';
 import '../domain/inference_settings.dart';
 import '../data/workflow_zip_service.dart';
+import 'autopilot.dart';
+import 'ci_batch.dart';
 import 'dev_mode.dart';
 import 'engine_lock.dart';
 import 'model_fit.dart';
@@ -141,7 +146,7 @@ class AppState {
     return null;
   }
 
-  int get cachedCount => models.where((m) => m.isCached).length;
+  int get cachedCount => models.where((m) => m.isCached && !isCloudPath(m.localPath)).length;
 
   AppState copyWith({
     bool? loaded,
@@ -244,6 +249,8 @@ class AppController extends Notifier<AppState> {
     }).toList();
     final totalRam = await ref.read(deviceRamProvider)();
     final pick = pickDefaultModels(models, totalRam);
+    await CloudConfig.instance.load(st); // bulut API anahtarları/sıralaması
+    models.addAll(cloudModels()); // seçilebilir bulut motorları (indirme gerektirmez)
     var wfs = await st.loadWorkflows();
     if (wfs == null || wfs.isEmpty) {
       wfs = defaultWorkflows(
@@ -1000,9 +1007,17 @@ class AppController extends Notifier<AppState> {
       return;
     }
 
-    final coverAll = cfg.coverAll;
-    final stepLimit = coverAll ? kDevMaxStepsCoverAll : total;
-    if (coverAll) {
+    final auto = cfg.autonomous;
+    final coverAll = cfg.coverAll && !auto;
+    final goal = cfg.goal.trim();
+    final nowMs0 = DateTime.now().millisecondsSinceEpoch;
+    var maxDur = cfg.maxDuration;
+    if (maxDur > kAutopilotMaxDuration) maxDur = kAutopilotMaxDuration;
+    if (maxDur < const Duration(minutes: 1)) maxDur = const Duration(minutes: 1);
+    final startedAtMs = cfg.startedAtMs ?? nowMs0;
+    final deadlineMs = cfg.deadlineMs ?? (nowMs0 + maxDur.inMilliseconds);
+    final stepLimit = auto ? kAutopilotMaxSteps : (coverAll ? kDevMaxStepsCoverAll : total);
+    if (coverAll || auto) {
       // Tahmini adım sayısı; gerçek sayı yeniden denetimlerle biraz farklı olabilir (aşılırsa güncellenir).
       final est = DevPlanner.estimateSteps(
         snap,
@@ -1063,24 +1078,313 @@ class AppController extends Notifier<AppState> {
         total: total,
         phase: 'Hazırlanıyor',
         sourceName: snap.name,
+        autonomous: auto,
+        deadlineMs: auto ? deadlineMs : 0,
+        stablePasses: cfg.resumeStablePasses,
+        improving: cfg.resumeImproving && goal.isNotEmpty,
+        fixedTotal: cfg.resumeFixed,
       ),
     );
     _flushTimer?.cancel();
     _flushTimer = Timer.periodic(const Duration(milliseconds: 40), (_) => _flush());
     _bridge.begin(devWf, state.models);
     await _wakelock(true);
+    if (auto) await NativeKeepAlive.acquire(); // 24 saatlik oturum boyunca ön plan servisi
 
     final runner = ref.read(runnerProvider);
     final cb = _callbacks(ct);
     final planner = DevPlanner();
     final results = <DevRoundResult>[];
+    final conv = AutopilotConvergence(stablePasses: cfg.resumeStablePasses);
+    final detSeen = <String, int>{}; // aynı yerel bulgu 2 kez düzeltilemezse bırakılır
+    var improving = auto && cfg.resumeImproving && goal.isNotEmpty;
+    // Web araştırması: hedef doğrultusunda geliştirmeye geçerken bir kez yapılır; notlar hedefe eklenir.
+    var goalEff = goal;
+    // HİBRİT: bulk iş yerel modellerle; yerel model takılırsa kısa süre ve süre bitmeden / kararlılıktan sonra
+    // SON DOĞRULAMA geçişi bulut modelleriyle yapılır (bulut anahtarı girilmişse).
+    final cloudCfg = CloudConfig.instance;
+    final hybrid = auto &&
+        cloudCfg.hybrid &&
+        cloudCfg.anyUsable &&
+        state.models.any((m) => m.id == kCloudAutoModelId) &&
+        !(isCloudPath(analyst.localPath) && isCloudPath(fixer.localPath));
+    var cloudFinal = false; // son doğrulama geçişi başladı mı (başlayınca oturum sonuna dek bulut)
+    var cloudBoost = 0; // yerel model takılınca bu kadar tur bulut
+    var cloudThisRound = false;
+    var localMiss = 0; // art arda yerel başarısızlık (boş çıktı / uygulanamayan yama)
+    AgentConfig agentFor(AgentConfig a) => cloudThisRound ? a.copyWith(modelId: kCloudAutoModelId) : a;
+    void startCloudFinal(String why) {
+      cloudFinal = true;
+      improving = false;
+      conv.stablePasses = 0;
+      _addLog('Sistem', 'Bulut son doğrulama geçişi başlıyor: $why', LogType.info);
+      _devSet((d) => d.copyWith(improving: false, stablePasses: 0));
+    }
+    Future<void> researchGoal() async {
+      if (!auto || goal.isEmpty) return;
+      _devSet((d) => d.copyWith(phase: 'Web araştırması yapılıyor'));
+      _addLog('Sistem', 'Hedef için web araştırması yapılıyor (Gemini + Google Arama)…', LogType.info);
+      final notes = await cloudResearch(goal);
+      if (notes == null) {
+        _addLog(
+          'Sistem',
+          'Araştırma atlandı (Gemini anahtarı yok, kapalı ya da kota dolu); araştırmasız sürüyor.',
+          LogType.warning,
+        );
+        return;
+      }
+      goalEff = '$goal\n\nARAŞTIRMA NOTLARI (web):\n$notes';
+      _addLog('Sistem', 'Araştırma notları alındı (${notes.length} karakter).', LogType.success);
+    }
+    var fixedTotal = cfg.resumeFixed;
+    var detThisRound = 0;
+    var clearCheckpoint = false;
+    String? autoNote;
     var curPath = saved; // bir sonraki turun girdisi olan en güncel ZIP
     String? prevOutput; // silinebilecek ara ZIP
     String? lastOutput;
     var failStreak = 0;
-    try {
-      for (var r = 1; r <= stepLimit; r++) {
+
+    // ---- Flutter modu: GitHub Actions üzerinde GERÇEK flutter analyze / test / derleme ----
+    final ciCfg = GithubCiConfig.instance;
+    var ciOn = cfg.flutterCi;
+    if (ciOn && !ciCfg.usable) await ciCfg.load(); // devam ettirilen oturumda ayarlar henüz yüklenmemiş olabilir
+    if (ciOn && !ciCfg.usable) {
+      ciOn = false;
+      _addLog('Flutter modu', 'Kapalı: GitHub anahtarı veya depo (sahip/depo) eksik ya da geçersiz.', LogType.warning);
+    }
+    final ci = GithubCi(ciCfg);
+    var ciDue = ciOn; // GitHub doğrulaması gerekli mi?
+    var ciClean = false; // son doğrulama temiz mi (ve sonra düzeltme yapılmadı mı)?
+    var ciBlocked = false; // Flutter modu ilerleyemeyip kapandı mı?
+    var ciRounds = 0;
+    var ciStall = 0;
+    var fixedSinceCi = 0;
+    var stableHold = false; // yerelde kararlı; GitHub doğrulaması bekleniyor
+    var stableRecheck = false; // doğrulama bitti; kararlılık kararı yeniden verilecek
+    const ciMaxRounds = 500;
+    const ciMaxStall = 6;
+
+    /// 0 = temiz, 1 = düzeltme yapıldı (yeniden doğrulanmalı), 2 = ilerlenemiyor (Flutter modu kapanır).
+    Future<int> ciRound(int r) async {
+      ciRounds++;
+      _devSet((d) => d.copyWith(phase: 'GitHub Actions: Flutter denetimi'));
+      state = state.copyWith(status: 'Flutter modu: GitHub Actions denetimi başlıyor…');
+      final res = await _ciCheck(ci, snap, ct);
+      if (res == null) {
+        _addLog('Flutter modu', 'GitHub\'a ulaşılamadı; Flutter modu bu oturumda kapatıldı.', LogType.error);
+        return 2;
+      }
+      if (res.ok) {
+        _addLog(
+          'Flutter modu',
+          'GitHub Actions: pub get, analyze${ciCfg.runTests ? ', test' : ''}${ciCfg.buildApk ? ', derleme' : ''} '
+              'BAŞARILI. ${res.runUrl}',
+          LogType.success,
+        );
+        return 0;
+      }
+      _addLog(
+        'Flutter modu',
+        '"${res.stage}" aşaması başarısız: ${res.diagnostics.length} sorun'
+            '${res.infoCount > 0 ? ' (${res.infoCount} bilgi notu düzeltmeye gönderilmez)' : ''}. ${res.runUrl}',
+        LogType.warning,
+      );
+      if (res.diagnostics.isEmpty) {
+        _addLog(
+          'Flutter modu',
+          'Dart kaynağına bağlanabilen hata ayrıştırılamadı (kurulum, Gradle veya benzeri). '
+              'Araç çıktısı AYNEN:\n${res.stageLog}',
+          LogType.error,
+        );
+        return 2;
+      }
+      final plan = CiBatcher.plan(snap, res.diagnostics, budget: runner.devChunkChars());
+      for (final u in plan.unmatched) {
+        _addLog('Flutter modu', 'Projede olmayan dosyaya işaret eden çıktı (aynen):\n${u.raw}', LogType.warning);
+      }
+      var changedAny = false;
+      final touched = <String>{};
+      var done = 0;
+      for (final b in plan.batches) {
         if (ct.cancelled) throw const CancelledException();
+        // Aynı dosyada önceki yama satır numaralarını kaydırdı; kalan sorunlar sonraki doğrulamada yeniden bildirilir.
+        if (touched.contains(b.path)) continue;
+        done++;
+        try {
+          _devSet((d) => d.copyWith(phase: '2. AI düzeltiyor (GitHub hatası $done/${plan.batches.length})'));
+          state = state.copyWith(
+            status: 'Flutter modu: ${res.stage} hatası düzeltiliyor — ${b.path} (${b.count} sorun)',
+          );
+          cb.agent(fixerAgent.id, AgentStatus.running, 0);
+          final fixOut = await runner.inferOnce(
+            agent: agentFor(fixerAgent),
+            system: DevPrompts.fixerSystem,
+            user: DevPrompts.ciFixerUser(b.plan, b.toolOutput, res.stage, partLabel: b.partLabel),
+            models: state.models,
+            cb: cb,
+            ct: ct,
+          );
+          cb.agent(fixerAgent.id, AgentStatus.completed, 0);
+          final outcome = await DevPatcher.apply(
+            snap: snap,
+            plan: b.plan,
+            patches: WorkflowRunner.parsePatches(fixOut),
+            reinfer: (prompt) => runner.inferOnce(
+              agent: agentFor(fixerAgent),
+              system: DevPrompts.fixerSystem,
+              user: prompt,
+              models: state.models,
+              cb: cb,
+              ct: ct,
+            ),
+          );
+          for (final n in outcome.notes) {
+            _addLog('Flutter modu', n, LogType.warning);
+          }
+          if (outcome.changed.isEmpty) continue;
+          final built = buildProjectZip(
+            files: outcome.changed,
+            rawContent: fixOut,
+            title: snap.name,
+            task: 'Flutter modu (GitHub Actions ${res.stage}): ${b.count} sorun düzeltildi',
+            base: snap,
+          );
+          final outDir = await ref.read(storageProvider).outputsDir();
+          final outPath =
+              '${outDir.path}/${_safeName(snap.name)}_flutter_t${r}_${DateTime.now().millisecondsSinceEpoch}.zip';
+          await File(outPath).writeAsBytes(built.bytes, flush: true);
+          if (ct.cancelled) {
+            try {
+              await File(outPath).delete();
+            } catch (_) {}
+            throw const CancelledException();
+          }
+          fixedTotal++;
+          if (auto) {
+            await _autopilotSave(
+              cfg,
+              zip: outPath,
+              round: r,
+              fixed: fixedTotal,
+              stable: conv.stablePasses,
+              improving: improving,
+              startedAtMs: startedAtMs,
+              deadlineMs: deadlineMs,
+            );
+            _devSet((d) => d.copyWith(fixedTotal: fixedTotal));
+          }
+          if (prevOutput != null) {
+            try {
+              await File(prevOutput!).delete(); // yalnızca bizim ürettiğimiz ara ZIP silinir
+            } catch (_) {}
+          }
+          prevOutput = outPath;
+          lastOutput = outPath;
+          curPath = outPath;
+          snap = await ProjectSource.load(curPath);
+          touched.add(b.path);
+          changedAny = true;
+          results.add(
+            DevRoundResult(
+              round: r,
+              status: DevRoundStatus.fixed,
+              reviewed: b.plan.labels,
+              findings: b.count,
+              changedFiles: outcome.changed.keys.toList()..sort(),
+              report: b.toolOutput,
+              notes: outcome.notes,
+            ),
+          );
+          _addLog('Flutter modu', 'ZIP güncellendi: ${outcome.changed.keys.join(', ')}', LogType.success);
+          _devSet((d) => d.copyWith(results: [...results], zipPath: outPath));
+        } on CancelledException {
+          rethrow;
+        } on ModelFileException {
+          rethrow;
+        } catch (e) {
+          cb.agent(fixerAgent.id, AgentStatus.error, 0);
+          _addLog('Flutter modu', 'Düzeltme turu başarısız (${b.path}): $e', LogType.error);
+        }
+      }
+      if (changedAny) {
+        ciStall = 0;
+        return 1;
+      }
+      ciStall++;
+      if (ciStall >= ciMaxStall) {
+        _addLog(
+          'Flutter modu',
+          'AI $ciStall denemede GitHub hatasını düzeltemedi; Flutter modu kapatıldı. Son araç çıktısı AYNEN:\n'
+              '${res.stageLog}',
+          LogType.error,
+        );
+        return 2;
+      }
+      await _autopilotWait(ct, autopilotBackoff(ciStall), 'Hata düzeltilemedi');
+      return 1;
+    }
+
+    try {
+      if (improving) await researchGoal();
+      final startRound = auto && cfg.resumeRound > 0 ? cfg.resumeRound + 1 : 1;
+      for (var r = startRound; r <= stepLimit; r++) {
+        if (ct.cancelled) throw const CancelledException();
+        if (auto) {
+          // 24 saatlik oturumda sonuç listesi bellekte şişmesin: yalnızca son 100 tur tutulur.
+          if (results.length > 150) results.removeRange(0, results.length - 100);
+          if (DateTime.now().millisecondsSinceEpoch >= deadlineMs) {
+            autoNote = 'Otonom mod: süre doldu (${autopilotDurationText(maxDur)}).';
+            _addLog('Sistem', autoNote, LogType.info);
+            break;
+          }
+          if (hybrid && !cloudFinal) {
+            // Toplam sürenin ~%14'ü (en çok 30 dk) kala bulut son doğrulama başlar; süre dolmadan yapılsın.
+            final reserveMs = ((deadlineMs - startedAtMs) ~/ 7).clamp(0, 30 * 60 * 1000);
+            if (deadlineMs - DateTime.now().millisecondsSinceEpoch <= reserveMs) {
+              startCloudFinal('süre azaldı, son kontrol bulutla yapılacak.');
+            }
+          }
+          await _autopilotSave(
+            cfg,
+            zip: curPath,
+            round: r - 1,
+            fixed: fixedTotal,
+            stable: conv.stablePasses,
+            improving: improving,
+            startedAtMs: startedAtMs,
+            deadlineMs: deadlineMs,
+          );
+          await _autopilotCooldown(ct);
+        }
+        if (ciOn && ciDue) {
+          if (ciRounds >= ciMaxRounds) {
+            ciOn = false;
+            ciBlocked = true;
+            _addLog('Flutter modu', 'GitHub doğrulama sayısı sınırına ($ciMaxRounds) ulaşıldı; kapatıldı.', LogType.warning);
+          } else {
+            final st = await ciRound(r);
+            if (st == 0) {
+              ciDue = false;
+              ciClean = true;
+              fixedSinceCi = 0;
+            } else if (st == 1) {
+              ciClean = false;
+              conv.stablePasses = 0;
+              stableHold = false; // düzeltme yapıldı: yeniden doğrulanacak
+            } else {
+              ciOn = false;
+              ciDue = false;
+              ciBlocked = true;
+            }
+            if (stableHold && st != 1) {
+              stableHold = false;
+              stableRecheck = true; // doğrulama bitti: kararlılık kararı yeniden verilsin
+            }
+            r--; // bu bir model turu değildir; tur sayacını tüketme
+            continue;
+          }
+        }
         if (r > total) {
           // "Tüm projeyi gez": tahmin aşıldı (yeniden denetimler); sayacı gerçeğe uydur.
           total = r;
@@ -1095,7 +1399,60 @@ class AppController extends Notifier<AppState> {
           _addLog('Sistem', 'İncelenecek içerik kalmadı; $r. turda durduruldu.', LogType.info);
           break;
         }
-        _devSet((d) => d.copyWith(round: r, phase: '1. AI analiz ediyor'));
+        if (auto && (conv.onPass(planner.passes) || stableRecheck)) {
+          // Proje baştan sona bir kez daha gezildi.
+          stableRecheck = false;
+          if (conv.stable) {
+            if (ciOn && !ciClean) {
+              // Yerelde kararlı; "hata kalmadı" demeden önce GitHub'da gerçek analyze/derleme temiz geçmeli.
+              stableHold = true;
+              ciDue = true;
+              _addLog('Sistem', 'Yerel denetim temiz; GitHub Actions doğrulaması bekleniyor.', LogType.info);
+              r--;
+              continue;
+            }
+            if (goal.isNotEmpty && !improving && !cloudFinal) {
+              improving = true;
+              conv.stablePasses = 0;
+              _addLog(
+                'Sistem',
+                'Proje kararlı (hata kalmadı); hedef doğrultusunda geliştirmeye geçildi.',
+                LogType.success,
+              );
+              await researchGoal();
+            } else if (hybrid && !cloudFinal) {
+              startCloudFinal('yerel modellerde proje kararlı; bulut modelleri bir kez daha tarayacak.');
+            } else {
+              autoNote = cloudFinal
+                  ? 'Otonom mod: bulut son doğrulaması da temiz, proje kararlı.'
+                  : improving
+                  ? 'Otonom mod: hedef için yeni iyileştirme kalmadı, proje kararlı.'
+                  : 'Otonom mod: proje kararlı, yerel denetimde hata kalmadı.';
+              _addLog('Sistem', autoNote, LogType.success);
+              break;
+            }
+          }
+          _devSet(
+            (d) => d.copyWith(stablePasses: conv.stablePasses, improving: improving, fixedTotal: fixedTotal),
+          );
+        }
+        final wasCloud = cloudThisRound;
+        cloudThisRound = hybrid && (cloudFinal || cloudBoost > 0);
+        if (cloudBoost > 0) cloudBoost--;
+        if (cloudThisRound != wasCloud) {
+          _addLog(
+            'Sistem',
+            cloudThisRound ? 'Bu tur bulut modeliyle çalışıyor.' : 'Yerel modellere dönüldü.',
+            LogType.info,
+          );
+        }
+        _devSet(
+          (d) => d.copyWith(
+            round: r,
+            phase:
+                '${improving ? '1. AI geliştirme öneriyor' : '1. AI analiz ediyor'}${cloudThisRound ? ' (bulut)' : ''}',
+          ),
+        );
         state = state.copyWith(
           status: 'Tur $r/$total — 1. AI analiz ediyor: ${plan.labels.join(', ')}',
         );
@@ -1104,16 +1461,39 @@ class AppController extends Notifier<AppState> {
           // 1. AI: hataları bul.
           cb.agent(analystAgent.id, AgentStatus.running, 0);
           final raw = await runner.inferOnce(
-            agent: analystAgent,
-            system: DevPrompts.analystSystem,
-            user: DevPrompts.analystUser(snap, plan, r, total),
+            agent: agentFor(analystAgent),
+            system: improving ? DevPrompts.improverSystem : DevPrompts.analystSystem,
+            user: improving
+                ? DevPrompts.improverUser(snap, plan, r, goalEff)
+                : DevPrompts.analystUser(snap, plan, r, total),
             models: state.models,
             cb: cb,
             ct: ct,
           );
           cb.agent(analystAgent.id, AgentStatus.completed, 0);
-          final report = DevReport.parse(raw, snap, scope: plan.paths);
+          var report = DevReport.parse(raw, snap, scope: plan.paths);
+          detThisRound = 0;
+          if (auto) {
+            // Yerel (kesin) denetim: model kaçırsa bile derleme/çalışmayı bozan sorunlar 2. AI'ya gider.
+            final fresh = <ProjectProblem>[];
+            for (final pr in AutopilotChecks.problemsFor(snap, plan.paths)) {
+              final key = '${pr.path}|${pr.message}';
+              final seen = (detSeen[key] ?? 0) + 1;
+              detSeen[key] = seen;
+              if (seen <= 2) fresh.add(pr);
+            }
+            final det = AutopilotChecks.toFindings(fresh);
+            detThisRound = det.length;
+            if (det.isNotEmpty) {
+              report = DevReport(
+                findings: [...det, ...report.findings],
+                dropped: report.dropped,
+                raw: raw,
+              );
+            }
+          }
           if (!report.hasFindings) {
+            conv.recordRound(fixed: 0, deterministicProblems: 0);
             planner.advance(plan);
             results.add(
               DevRoundResult(
@@ -1127,6 +1507,7 @@ class AppController extends Notifier<AppState> {
               ),
             );
             failStreak = 0;
+            localMiss = 0;
             _addLog('Tur $r/$total', '1. AI hata bulamadı.', LogType.success);
             _devSet((d) => d.copyWith(results: [...results]));
             continue;
@@ -1138,7 +1519,7 @@ class AppController extends Notifier<AppState> {
           state = state.copyWith(status: 'Tur $r/$total — 2. AI düzeltiyor (${report.findings.length} sorun)');
           cb.agent(fixerAgent.id, AgentStatus.running, 0);
           final fixOut = await runner.inferOnce(
-            agent: fixerAgent,
+            agent: agentFor(fixerAgent),
             system: DevPrompts.fixerSystem,
             user: DevPrompts.fixerUser(plan, report),
             models: state.models,
@@ -1151,7 +1532,7 @@ class AppController extends Notifier<AppState> {
             plan: plan,
             patches: WorkflowRunner.parsePatches(fixOut),
             reinfer: (prompt) => runner.inferOnce(
-              agent: fixerAgent,
+              agent: agentFor(fixerAgent),
               system: DevPrompts.fixerSystem,
               user: prompt,
               models: state.models,
@@ -1163,6 +1544,7 @@ class AppController extends Notifier<AppState> {
             _addLog('Tur $r/$total', n, LogType.warning);
           }
           if (outcome.changed.isEmpty) {
+            conv.recordRound(fixed: 0, deterministicProblems: detThisRound);
             planner.advance(plan);
             results.add(
               DevRoundResult(
@@ -1175,6 +1557,11 @@ class AppController extends Notifier<AppState> {
               ),
             );
             failStreak = 0;
+            if (hybrid && !cloudThisRound && ++localMiss >= 2) {
+              localMiss = 0;
+              cloudBoost = 3;
+              _addLog('Sistem', 'Yerel model art arda yama üretemedi; sonraki 3 tur bulutla.', LogType.warning);
+            }
             _devSet((d) => d.copyWith(results: [...results]));
             continue;
           }
@@ -1198,6 +1585,27 @@ class AppController extends Notifier<AppState> {
             } catch (_) {}
             throw const CancelledException();
           }
+          conv.recordRound(fixed: 1, deterministicProblems: detThisRound);
+          fixedTotal++;
+          ciClean = false;
+          if (ciOn && ++fixedSinceCi >= 8) {
+            ciDue = true; // her 8 düzeltmede bir gerçek derleme denetimi
+            fixedSinceCi = 0;
+          }
+          if (auto) {
+            // Eski ara ZIP silinmeden ÖNCE kontrol noktası yeni ZIP'e taşınır (süreç ölse bile bozulmaz).
+            await _autopilotSave(
+              cfg,
+              zip: outPath,
+              round: r,
+              fixed: fixedTotal,
+              stable: conv.stablePasses,
+              improving: improving,
+              startedAtMs: startedAtMs,
+              deadlineMs: deadlineMs,
+            );
+            _devSet((d) => d.copyWith(fixedTotal: fixedTotal));
+          }
           if (prevOutput != null) {
             try {
               await File(prevOutput).delete(); // yalnızca bizim ürettiğimiz ara ZIP silinir
@@ -1220,6 +1628,7 @@ class AppController extends Notifier<AppState> {
             ),
           );
           failStreak = 0;
+          localMiss = 0;
           _addLog('Tur $r/$total', 'ZIP güncellendi: ${outcome.changed.keys.join(', ')}', LogType.success);
           _devSet((d) => d.copyWith(results: [...results], zipPath: outPath));
         } on CancelledException {
@@ -1231,7 +1640,13 @@ class AppController extends Notifier<AppState> {
           cb.agent(analystAgent.id, AgentStatus.error, 0);
           cb.agent(fixerAgent.id, AgentStatus.error, 0);
           planner.advance(plan);
+          conv.recordRound(fixed: 0, deterministicProblems: 1);
           failStreak++;
+          if (hybrid && !cloudThisRound && ++localMiss >= 2) {
+            localMiss = 0;
+            cloudBoost = 3;
+            _addLog('Sistem', 'Yerel model art arda geçerli çıktı veremedi; sonraki 3 tur bulutla.', LogType.warning);
+          }
           results.add(
             DevRoundResult(
               round: r,
@@ -1242,12 +1657,31 @@ class AppController extends Notifier<AppState> {
           );
           _addLog('Tur $r/$total', 'Tur başarısız: $e', LogType.error);
           _devSet((d) => d.copyWith(results: [...results]));
-          if (failStreak >= 2) {
-            throw StateError('Art arda iki turda model geçerli çıktı üretemedi: $e');
+          if (failStreak >= (auto ? kAutopilotMaxFailStreak : 2)) {
+            throw StateError('Art arda $failStreak turda model geçerli çıktı üretemedi: $e');
+          }
+          if (auto) {
+            // Kendi kendine toparlanma: bekle (üstel geri çekilme), sonra aynı projeyle devam et.
+            await _autopilotWait(ct, autopilotBackoff(failStreak), 'Model hata verdi');
           }
         }
       }
       if (ct.cancelled) throw const CancelledException();
+      if (!auto && ciOn && !ciClean) {
+        // Tur sayısı bitti: sonuç ZIP'in GitHub'da gerçekten temiz geçtiğini doğrula (en çok 6 deneme).
+        for (var k = 0; k < 6 && ciOn; k++) {
+          final st = await ciRound(total);
+          if (st == 0) {
+            ciClean = true;
+            break;
+          }
+          if (st == 2) {
+            ciOn = false;
+            ciBlocked = true;
+          }
+        }
+        if (!ciClean && ciOn) ciBlocked = true;
+      }
 
       // Bitiş: en güncel ZIP, sonuç ekranında Aç/İndir olarak sunulur.
       final fixedCount = results.where((x) => x.status == DevRoundStatus.fixed).length;
@@ -1286,22 +1720,37 @@ class AppController extends Notifier<AppState> {
         );
       }
       _devSet((d) => d.copyWith(active: false, phase: 'Tamamlandı', zipPath: lastOutput));
+      clearCheckpoint = true;
       final allFailed = results.isNotEmpty && results.every((x) => x.status == DevRoundStatus.failed);
       state = state.copyWith(
         artifact: art,
         failed: allFailed,
-        status: allFailed
+        status: (auto && autoNote != null && !allFailed)
+            ? '$autoNote Bu oturumda $fixedTotal turda düzeltme yapıldı.${lastOutput != null ? ' ZIP hazır.' : ''}'
+            : allFailed
             ? 'Geliştirme tamamlanamadı: hiçbir tur geçerli çıktı üretemedi. Günlüğe bak.'
             : fixedCount > 0
             ? 'Geliştirme tamamlandı: $fixedCount turda düzeltme yapıldı. ZIP hazır.'
             : 'Geliştirme tamamlandı: hiçbir turda uygulanabilir düzeltme çıkmadı.',
       );
       _addLog('Sistem', summary.toString().trim(), LogType.success);
+      if (cfg.flutterCi && (ciBlocked || !ciClean)) {
+        _addLog(
+          'Flutter modu',
+          'UYARI: Son ZIP GitHub Actions\'ta TEMİZ olarak doğrulanamadı. Günlükteki araç çıktısına bak.',
+          LogType.warning,
+        );
+        state = state.copyWith(status: '${state.status} UYARI: GitHub doğrulaması tamamlanamadı.');
+      } else if (cfg.flutterCi) {
+        _addLog('Flutter modu', 'Son ZIP GitHub Actions\'ta doğrulandı: analyze/derleme temiz.', LogType.success);
+      }
     } on CancelledException {
+      clearCheckpoint = true; // kullanıcı bilerek durdurdu: devam teklifi gösterilmez
       _devSet((d) => d.copyWith(active: false, phase: 'İptal edildi', zipPath: lastOutput));
       _onCancelled();
     } catch (e) {
       if (ct.cancelled) {
+        clearCheckpoint = true;
         _devSet((d) => d.copyWith(active: false, phase: 'İptal edildi', zipPath: lastOutput));
         _onCancelled();
       } else {
@@ -1330,9 +1779,154 @@ class AppController extends Notifier<AppState> {
       _active.clear();
       _bridge.end(failed: state.failed, cancelled: ct.cancelled);
       await _wakelock(false);
+      if (auto) {
+        await NativeKeepAlive.release();
+        if (clearCheckpoint) {
+          try {
+            await ref.read(storageProvider).deleteJson(kAutopilotFile);
+          } catch (_) {}
+        }
+      }
       state = state.copyWith(running: false, cancelling: false);
     }
   }
+
+  // ---- Otonom mod (24 saat) yardımcıları ----
+
+  Future<void> _autopilotSave(
+    DevModeConfig cfg, {
+    required String zip,
+    required int round,
+    required int fixed,
+    required int stable,
+    required bool improving,
+    required int startedAtMs,
+    required int deadlineMs,
+  }) async {
+    try {
+      final cp = AutopilotCheckpoint(
+        zipPath: zip,
+        analystModelId: cfg.analystModelId,
+        fixerModelId: cfg.fixerModelId,
+        startedAtMs: startedAtMs,
+        deadlineMs: deadlineMs,
+        goal: cfg.goal.trim(),
+        round: round,
+        fixedTotal: fixed,
+        stablePasses: stable,
+        improving: improving,
+        updatedAtMs: DateTime.now().millisecondsSinceEpoch,
+        flutterCi: cfg.flutterCi,
+      );
+      await ref.read(storageProvider).saveJson(kAutopilotFile, cp.toJson());
+    } catch (_) {
+      // Kontrol noktası yazılamazsa oturum yine sürer (yalnızca devam teklifi kaybolur).
+    }
+  }
+
+  /// [d] kadar bekler; iptalde hemen [CancelledException] fırlatır.
+  Future<void> _autopilotWait(CancelToken ct, Duration d, String reason) async {
+    final end = DateTime.now().add(d);
+    while (!ct.cancelled) {
+      final left = end.difference(DateTime.now());
+      if (left <= Duration.zero) break;
+      state = state.copyWith(status: '$reason — ${autopilotDurationText(left)} sonra yeniden denenecek');
+      _devSet((x) => x.copyWith(phase: 'Bekleniyor: $reason'));
+      final tick = left < const Duration(seconds: 2) ? left : const Duration(seconds: 2);
+      await Future.any<void>([Future<void>.delayed(tick), ct.onCancel]);
+    }
+    if (ct.cancelled) throw const CancelledException();
+  }
+
+  /// GitHub Actions denetimi; geçici (ağ, kota, çalışma iptali) hatalarda üstel geri çekilmeyle yeniden dener.
+  /// Yanlış anahtar/depo gibi kalıcı hatada veya çok sayıda başarısız denemeden sonra null döner.
+  Future<CiResult?> _ciCheck(GithubCi ci, ProjectSnapshot snap, CancelToken ct) async {
+    const maxTries = 12;
+    var fails = 0;
+    while (true) {
+      if (ct.cancelled) throw const CancelledException();
+      String why;
+      Duration? wait;
+      try {
+        return await ci.check(
+          snap,
+          cancelled: () => ct.cancelled,
+          onCancel: ct.onCancel,
+          status: (s) {
+            state = state.copyWith(status: s);
+            _devSet((d) => d.copyWith(phase: s));
+          },
+        );
+      } on CiCancelledException {
+        throw const CancelledException();
+      } on CiHttpException catch (e) {
+        if (e.permanent) {
+          _addLog(
+            'Flutter modu',
+            'GitHub erişim hatası (yeniden denemek işe yaramaz; anahtar, yetki veya depo adını kontrol et): $e',
+            LogType.error,
+          );
+          return null;
+        }
+        why = '$e';
+        wait = e.retryAfter;
+      } on CiTransientException catch (e) {
+        why = e.message;
+      } catch (e) {
+        why = '$e';
+      }
+      fails++;
+      _addLog('Flutter modu', 'GitHub denemesi başarısız ($fails/$maxTries): $why', LogType.warning);
+      if (fails >= maxTries) return null;
+      await _autopilotWait(ct, wait ?? autopilotBackoff(fails), 'GitHub bağlantısı');
+    }
+  }
+
+  /// Telefon aşırı ısındıysa (SEVERE+) en çok 10 dk soğumasını bekler.
+  Future<void> _autopilotCooldown(CancelToken ct) async {
+    final limit = DateTime.now().add(const Duration(minutes: 10));
+    while (autopilotNeedsCooldown(await DeviceThermal.status())) {
+      if (DateTime.now().isAfter(limit) || ct.cancelled) break;
+      await _autopilotWait(ct, const Duration(seconds: 20), 'Telefon çok ısındı, soğuması bekleniyor');
+    }
+  }
+
+  /// Önceki oturumdan kalan, hâlâ geçerli bir otonom oturum varsa döner (yoksa null).
+  Future<AutopilotCheckpoint?> pendingAutopilot() async {
+    try {
+      final raw = await ref.read(storageProvider).loadJson(kAutopilotFile);
+      final cp = AutopilotCheckpoint.fromJson(raw);
+      if (cp == null) return null;
+      if (cp.expired(DateTime.now()) || !File(cp.zipPath).existsSync()) {
+        await ref.read(storageProvider).deleteJson(kAutopilotFile);
+        return null;
+      }
+      return cp;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  /// Yarım kalan otonom oturumu KALDIĞI yerden sürdürür (süre, tur ve sayaçlar korunur).
+  Future<void> resumeAutopilot(AutopilotCheckpoint cp) => startDevMode(
+    DevModeConfig(
+      zipPath: cp.zipPath,
+      rounds: 1,
+      analystModelId: cp.analystModelId,
+      fixerModelId: cp.fixerModelId,
+      autonomous: true,
+      goal: cp.goal,
+      startedAtMs: cp.startedAtMs,
+      deadlineMs: cp.deadlineMs,
+      resumeRound: cp.round,
+      resumeFixed: cp.fixedTotal,
+      resumeStablePasses: cp.stablePasses,
+      resumeImproving: cp.improving,
+      flutterCi: cp.flutterCi,
+    ),
+  );
+
+  Future<void> discardAutopilot() => ref.read(storageProvider).deleteJson(kAutopilotFile);
 
   /// Seçilen ZIP akış paketini (workflow.json + prompts/configs) yeni bir akış olarak ekler.
   Future<void> importWorkflowZip(String path) async {

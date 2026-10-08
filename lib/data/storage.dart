@@ -41,6 +41,18 @@ class Storage {
     }
   }
 
+  /// Genel amaçlı küçük JSON dosyaları (ör. otonom mod kontrol noktası).
+  Future<Object?> loadJson(String name) => _read(name);
+
+  Future<void> saveJson(String name, Object data) => _write(name, data);
+
+  Future<void> deleteJson(String name) async {
+    try {
+      final f = File(p.join((await _base()).path, name));
+      if (await f.exists()) await f.delete();
+    } catch (_) {}
+  }
+
   Future<List<Workflow>?> loadWorkflows() async {
     final raw = await _read('workflows.json');
     if (raw is! List) return null;

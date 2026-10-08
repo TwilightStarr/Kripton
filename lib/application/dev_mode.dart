@@ -16,7 +16,42 @@ class DevModeConfig {
     required this.analystModelId,
     required this.fixerModelId,
     this.coverAll = false,
+    this.autonomous = false,
+    this.goal = '',
+    this.maxDuration = const Duration(hours: 24),
+    this.startedAtMs,
+    this.deadlineMs,
+    this.resumeRound = 0,
+    this.resumeFixed = 0,
+    this.resumeStablePasses = 0,
+    this.resumeImproving = false,
+    this.flutterCi = false,
   });
+
+  /// Flutter modu: GitHub Actions üzerinde GERÇEK `flutter analyze` / test / derleme çalıştırılır; araç
+  /// çıktısı kırpılmadan 2. AI'ya verilir. Otonom modda proje kararlı sayılmadan önce temiz geçmelidir.
+  final bool flutterCi;
+
+  /// true ise (24 saate kadar) otonom çalışır: tur sayısı yok sayılır; hata kalmayana kadar
+  /// projeyi tekrar tekrar gezer, hatalarda bekleyip yeniden dener, her turdan sonra kontrol
+  /// noktası yazar (süreç ölse bile kaldığı yerden devam edilebilir).
+  final bool autonomous;
+
+  /// Otonom modda, proje kararlı olduktan sonra uygulanacak geliştirme hedefi (boş olabilir).
+  final String goal;
+
+  /// Otonom oturumun en uzun süresi (en çok 24 saat).
+  final Duration maxDuration;
+
+  /// Devam ettirilen oturumun özgün başlangıç/bitiş zamanı (ms); yoksa şimdiden hesaplanır.
+  final int? startedAtMs;
+  final int? deadlineMs;
+
+  /// Devam ettirilen oturumdan taşınan sayaçlar.
+  final int resumeRound;
+  final int resumeFixed;
+  final int resumeStablePasses;
+  final bool resumeImproving;
 
   /// true ise [rounds] yok sayılır: bağlama sığan parçalar, projedeki her kaynak dosya baştan sona
   /// bir kez incelenene kadar (en çok [kDevMaxStepsCoverAll] adım) otomatik sürer. Her adım yine
@@ -87,7 +122,23 @@ class DevProgress {
     this.zipPath,
     this.sourceName = '',
     this.results = const [],
+    this.autonomous = false,
+    this.deadlineMs = 0,
+    this.stablePasses = 0,
+    this.improving = false,
+    this.fixedTotal = 0,
   });
+
+  /// Otonom (24 saatlik) oturum mu?
+  final bool autonomous;
+
+  /// Otonom oturumun bitiş zamanı (ms, epoch).
+  final int deadlineMs;
+  final int stablePasses;
+  final bool improving;
+
+  /// Oturum boyunca (devam ettirilenler dahil) düzeltme yapılan tur sayısı.
+  final int fixedTotal;
 
   final bool active;
   final int total;
@@ -111,6 +162,9 @@ class DevProgress {
     String? zipPath,
     String? sourceName,
     List<DevRoundResult>? results,
+    int? stablePasses,
+    bool? improving,
+    int? fixedTotal,
   }) => DevProgress(
     active: active ?? this.active,
     total: total ?? this.total,
@@ -119,6 +173,11 @@ class DevProgress {
     zipPath: zipPath ?? this.zipPath,
     sourceName: sourceName ?? this.sourceName,
     results: results ?? this.results,
+    autonomous: autonomous,
+    deadlineMs: deadlineMs,
+    stablePasses: stablePasses ?? this.stablePasses,
+    improving: improving ?? this.improving,
+    fixedTotal: fixedTotal ?? this.fixedTotal,
   );
 }
 
@@ -180,6 +239,9 @@ class DevPlanner {
   final Map<String, int> _cursor = {};
   final Map<String, int> _rechecked = {};
 
+  /// Proje baştan sona kaç kez tamamen gezildi (her başa sarışta 1 artar).
+  int passes = 0;
+
   /// Denetlenecek dosya mı? (Yalnızca kaynak: lib/ ve test/ altındaki Dart + pubspec.)
   static bool eligible(String path) =>
       path == 'pubspec.yaml' ||
@@ -237,6 +299,7 @@ class DevPlanner {
       // Her şey incelendi: başa sar ve ikinci geçişi dene.
       _cursor.clear();
       _rechecked.clear();
+      passes++;
     }
     return null;
   }
@@ -395,6 +458,29 @@ class DevPrompts {
       '- Uydurma paket API\'si kullanma; kullanılmayan import bırakma.\n'
       '- Yama bloklarının dışında açıklama yazma.';
 
+  /// Proje kararlı olduktan sonra (hata kalmadığında) hedef doğrultusunda geliştirme önerir.
+  /// Çıktı biçimi hata raporuyla AYNIDIR; böylece 2. AI aynı yoldan yama üretir.
+  static const String improverSystem =
+      'Sen kıdemli bir Flutter/Dart geliştiricisisin. Kod YAZMA; verilen kod bölümüne bakıp KULLANICI '
+      'HEDEFİNE hizmet eden TEK bir somut, küçük ve güvenli iyileştirmeyi veya eksik özelliği öner.\n'
+      'Kurallar:\n'
+      '- Kod bir dosyanın BİR BÖLÜMÜdür; başı veya sonu kesik olabilir.\n'
+      '- Çalışan kodu bozma; paket ekleme; yalnızca verilen bölümde yapılabilecek değişiklik öner.\n'
+      '- Bu bölümde hedefe katkı yapacak bir şey yoksa yalnızca şunu yaz: [SORUN YOK]\n'
+      '- Tam dosya yolunu aynen kullan. Biçim:\n'
+      'Dosya: yol\n'
+      'Yer: sınıf veya fonksiyon adı\n'
+      'Sorun: eksik olan veya iyileştirilecek şey\n'
+      'Düzeltme: kısaca ne yapılmalı';
+
+  static String improverUser(ProjectSnapshot snap, DevRoundPlan plan, int round, String goal) {
+    final deps = _depLine(snap);
+    return 'TUR $round. KULLANICI HEDEFİ: $goal\n\n'
+        'Projedeki dosyalar (import kontrolü için): ${_fileList(snap)}\n'
+        '${deps.isEmpty ? '' : '$deps\n'}\n'
+        'KOD:\n${plan.codeBlock}';
+  }
+
   static String _depLine(ProjectSnapshot snap) {
     final pub = snap.text['pubspec.yaml'];
     if (pub == null) return '';
@@ -434,6 +520,15 @@ class DevPrompts {
         '${deps.isEmpty ? '' : '$deps\n'}\n'
         'KOD:\n${plan.codeBlock}';
   }
+
+  /// Flutter modu: gerçek araç çıktısı ([toolOutput], hiç kırpılmadan) ile 2. AI'ya giden metin.
+  static String ciFixerUser(DevRoundPlan plan, String toolOutput, String stage, {String? partLabel}) =>
+      'GitHub Actions üzerinde GERÇEK "$stage" aşaması BAŞARISIZ oldu. Aşağıdaki araç çıktısı hiç '
+      'kırpılmadan, aynen verilmiştir${partLabel == null ? '' : ' ($partLabel; çıktı uzun olduğu için bölündü)'}. '
+      'Yalnızca bu çıktıdaki hataları düzelt.\n\n'
+      'ARAÇ ÇIKTISI:\n$toolOutput\n\n'
+      'KOD:\n${plan.codeBlock}\n'
+      '${WorkflowRunner.patchFormatInstruction}';
 
   /// 2. AI'ya giden kullanıcı metni.
   static String fixerUser(DevRoundPlan plan, DevReport report) =>

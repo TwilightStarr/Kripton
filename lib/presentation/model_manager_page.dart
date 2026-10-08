@@ -4,6 +4,7 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import '../application/app_controller.dart';
 import '../application/model_fit.dart';
 import '../core/theme.dart';
+import '../data/cloud_engine.dart' show isCloudPath;
 import '../domain/entities.dart';
 import 'miui_hint.dart';
 
@@ -59,7 +60,7 @@ class ModelManagerPage extends ConsumerWidget {
               border: Border.all(color: KColors.border),
             ),
             child: Text(
-              'Modeller bir kez indirilir ve ${s.cachedCount} / ${s.models.length} model yerelde. Aynı model tüm akışlarda yeniden indirilmeden yerel dosya yolundan yüklenir.',
+              'Modeller bir kez indirilir ve ${s.cachedCount} / ${s.models.where((m) => !isCloudPath(m.localPath)).length} model yerelde. Aynı model tüm akışlarda yeniden indirilmeden yerel dosya yolundan yüklenir.',
               style: TextStyle(fontSize: 12, color: KColors.muted, height: 1.4),
             ),
           ),
@@ -72,7 +73,7 @@ class ModelManagerPage extends ConsumerWidget {
               ),
             ),
           const SizedBox(height: 12),
-          for (final m in s.models)
+          for (final m in s.models.where((m) => !isCloudPath(m.localPath)))
             Container(
               margin: const EdgeInsets.only(bottom: 10),
               padding: const EdgeInsets.all(14),
