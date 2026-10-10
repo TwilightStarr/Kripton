@@ -1,0 +1,38 @@
+name: quanta
+description: Tamamen çevrimdışı şifre yöneticisi (kripto çekirdeği + veri katmanı). Fully offline password manager.
+publish_to: "none"
+version: 0.1.0+1
+
+environment:
+  sdk: ">=3.4.0 <4.0.0"
+  flutter: ">=3.22.0"
+
+dependencies:
+  flutter:
+    sdk: flutter
+  flutter_riverpod: 2.5.1
+  # Türkçe yerel ayar için (SDK içinde; ek paket indirmez).
+  flutter_localizations:
+    sdk: flutter
+  # Uygulamaya özel dizin (kasa dosyaları). Lisans: BSD-3-Clause. İzin gerektirmez;
+  # Android uygulaması `namespace` tanımlar (AGP 8 uyumlu).
+  path_provider: ^2.1.4
+  # Saf Dart. `cryptography_flutter` bilerek YOK: 2.3.2 sürümü AGP 8'in zorunlu kıldığı `namespace`
+  # alanını tanımlamıyor (release derlemesini kırar) ve Argon2id/XChaCha20'yi zaten yerelleştirmiyor.
+  cryptography: 2.7.0
+  # --- Aşama 2 (veri katmanı). Sürümleri `flutter pub get` ile doğrulayın.
+  # sqlite3_flutter_libs ile BİRLİKTE KULLANMAYIN (SQLCipher ile çakışır).
+  drift: ^2.18.0
+  sqlite3: ^2.4.0
+  sqlcipher_flutter_libs: ^0.6.1
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: 4.0.0
+  # Test makinesinde sistem sqlite3 kütüphanesi gerekir (Linux: libsqlite3-dev).
+
+flutter:
+  uses-material-design: true # Material ikonları (font gömülür, izin gerektirmez)
+  assets:
+    - assets/wordlists/

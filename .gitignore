@@ -1,0 +1,34 @@
+# Flutter / Dart
+.dart_tool/
+.packages
+.flutter-plugins
+.flutter-plugins-dependencies
+build/
+pubspec.lock
+coverage/
+*.iml
+.idea/
+.vscode/
+
+# Android
+android/.gradle/
+android/local.properties
+android/key.properties
+*.jks
+*.keystore
+*.apk
+*.aab
+
+# Python
+__pycache__/
+*.pyc
+
+# Downloaded assets (tool/fetch_assets.sh ile indirilir, depoya eklenmez)
+assets/wordlists/*.txt
+!assets/wordlists/README.txt
+
+# Gerçek kasa / yedek dosyaları asla commit edilmemeli (test fixture'ı hariç)
+*.quanta
+!test/fixtures/backup_v1.quanta
+.env
+.DS_Store

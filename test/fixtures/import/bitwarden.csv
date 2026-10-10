@@ -1,0 +1,4 @@
+folder,favorite,type,name,notes,fields,reprompt,login_uri,login_username,login_password,login_totp
+İş,1,login,"Örnek, Site","çok
+satırlı not","Hesap: ana",0,https://example.com,ali,"p""ass",otpauth://totp/Ex:ali?secret=GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ&issuer=Ex
+,0,note,Not1,gövde,,0,,,,

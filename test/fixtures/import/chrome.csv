@@ -1,0 +1,3 @@
+name,url,username,password,note
+example.com,https://example.com/login,ali,pw-1,
+sub.site.org,https://sub.site.org,veli,pw-2,"not, virgüllü"
