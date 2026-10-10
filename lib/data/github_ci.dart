@@ -399,13 +399,59 @@ jobs:
             printf '\n##KRIPTON-%s:%s:%s\n' END "$name" "$code"
             return $code
           }
+          # `flutter create` projede test/widget_test.dart yoksa MyApp'e bağlı varsayılan bir şablon
+          # üretir; bizim projede MyApp olmadığından analyze "The name 'MyApp' isn't a class" ile düşer.
+          # YALNIZCA bu varsayılan şablon silinir: dosya MyApp'e atıf yapmıyorsa ya da projede
+          # `class MyApp` varsa (kullanıcının kendi testi) dokunulmaz. Dönüş: 0 = silindi, 1 = silinmedi.
+          # "quiet" verilirse silinmediğinde bir şey yazmaz (analyze çıktısı kirlenmesin).
+          prune_default_widget_test() {
+            local f=test/widget_test.dart
+            if [ ! -f "$f" ]; then
+              [ "$1" = quiet ] || echo "[Kripton] $f yok; temizlenecek varsayılan test bulunmadı."
+              return 1
+            fi
+            if ! grep -qw 'MyApp' "$f"; then
+              [ "$1" = quiet ] || echo "[Kripton] $f MyApp'e atıf yapmıyor; dokunulmadı."
+              return 1
+            fi
+            if grep -rqE 'class[[:space:]]+MyApp([^A-Za-z0-9_]|$)' lib 2>/dev/null; then
+              [ "$1" = quiet ] || echo "[Kripton] $f korundu: projede MyApp sınıfı var."
+              return 1
+            fi
+            rm -f "$f" || return 1
+            echo "[Kripton] $f SİLİNDİ: flutter create varsayılan şablonu (MyApp'e bağlı) ve projede MyApp sınıfı yok."
+            return 0
+          }
+          cleanup_default_test() {
+            prune_default_widget_test
+            return 0
+          }
+          # analyze düşerse ve neden o varsayılan test ise: dosyayı sil, analyze'ı BİR kez yeniden çalıştır.
+          # İlk denemenin çıktısı satır başına ön ek konarak saklanır (ayrıştırıcı onu sorun saymaz).
+          run_analyze() {
+            local out code
+            out=$(mktemp)
+            flutter analyze --no-fatal-infos > "$out" 2>&1
+            code=$?
+            if [ "$code" -ne 0 ] && prune_default_widget_test quiet; then
+              echo "[Kripton] analyze başarısız: hata varsayılan test/widget_test.dart dosyasındandı; dosya silindi, analyze bir kez yeniden çalıştırılıyor."
+              sed 's/^/[ilk deneme] /' "$out"
+              rm -f "$out"
+              flutter analyze --no-fatal-infos 2>&1
+              return $?
+            fi
+            cat "$out"
+            rm -f "$out"
+            return $code
+          }
           if [ -f tool/ci_prebuild.sh ]; then stage prebuild bash tool/ci_prebuild.sh || exit 1; fi
           if [ ! -d android ]; then
             NAME=$(grep -m1 '^name:' pubspec.yaml | awk '{print $2}' | tr -d '\r')
             stage create flutter create --project-name "$NAME" --org com.kripton --platforms android . || exit 1
           fi
+          stage cleanup cleanup_default_test
           stage pub-get flutter pub get || exit 1
-          stage analyze flutter analyze --no-fatal-infos || exit 1
+          stage analyze run_analyze || exit 1
           if [ -d test ] && [ "$KRIPTON_TEST" = "1" ]; then stage test flutter test || exit 1; fi
           if [ "$KRIPTON_BUILD" = "1" ]; then stage build flutter build apk --debug || exit 1; fi
           exit 0

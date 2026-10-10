@@ -109,6 +109,25 @@ satır 'tırnak' }''';
       );
     });
 
+    test('iskelet test/widget_test.dart dosyası MyApp\'e bağımlı değil (CI temizliğinin hedefi olmaz)', () {
+      final r = FlutterProjectKit.scaffold({'lib/main.dart': 'void main() {}\n'}, title: 'Demo');
+      final src = r.files['test/widget_test.dart'];
+      expect(src, isNotNull);
+      expect(r.addedFiles, contains('test/widget_test.dart'));
+      expect(RegExp(r'\bMyApp\b').hasMatch(src!), isFalse);
+      expect(src, isNot(contains('package:demo/')));
+    });
+
+    test('kullanıcının kendi test/widget_test.dart dosyası (MyApp dahil) iskeletle ezilmez', () {
+      const own = "import 'package:demo/main.dart';\nvoid main() { MyApp(); }\n";
+      final r = FlutterProjectKit.scaffold(
+        {'pubspec.yaml': _pubspec, 'lib/main.dart': 'class MyApp {}\nvoid main() {}\n', 'test/widget_test.dart': own},
+        title: 'Demo',
+      );
+      expect(r.files['test/widget_test.dart'], own);
+      expect(r.addedFiles, isNot(contains('test/widget_test.dart')));
+    });
+
     test('model kendi pubspec.yaml dosyasını yazdıysa ona dokunulmaz, yalnızca eksik paket eklenir', () {
       final r = FlutterProjectKit.scaffold(
         {
