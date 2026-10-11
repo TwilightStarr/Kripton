@@ -178,47 +178,46 @@ class GithubCiRunner {
 ## GÖREV 4/10: Doğrulama kapıları, doğrulayıcı AI ve hata defteri
 
 ### Yapılanlar
-- `lib/application/dev_guard.dart` (YENİ, Kimi çıktısı + düzeltmeler): `DevGuard` kapıları G1-G8; `GuardViolation`, `GuardVerdict`, `kGateDescriptions`.
-- `lib/application/dev_ledger.dart` (YENİ): `DevErrorEntry`, `LedgerStore`, `MemoryLedgerStore`, `FileLedgerStore`, `DevLedger` (kayıt, JSONL döndürme, istatistik, `lessons`), `ModelTrust`. Kimi yalnızca imzaları ve testi vermişti; dosya imzalara ve teste göre yazıldı.
-- `lib/application/dev_mode.dart`: `DevPrompts.lessons/lessonsBlock`, `verifierSystem/verifierUser/parseVerifier`, `VerifierPolicy.choose`, `DevPatcher.onReject` kancası (3 yerde çağrılır). `analystUser`, `improverUser` ve `fixerUser` sonuna `lessonsBlock()` eklendi (ders yoksa boş; mevcut metinler değişmez).
-- Testler: `test/dev_guard_test.dart`, `test/dev_ledger_test.dart`.
+- `lib/application/dev_guard.dart` (YENİ): `DevGuard.check` — modelin HAM yama çıktısını (mevcut ESKİ/YENİ/TAM biçimi; yeni biçim yok) kapılardan geçirir. FAIL-CLOSED: `GuardVerdict.ok` = ihlal yok VE en az bir gerçek değişiklik; istisna → `G0`. `ok` iken `changes` (yol → TAM yeni içerik) tam olarak doğrulanan içeriktir; commit bundan yapılmalı. ESKİ blok BİREBİR ve TEK kez eşleşmelidir (`applyPatch`'in boşluk-normalleştirilmiş yedeği KULLANILMAZ).
+  - G1 biçim (açılış/kapanış sayısı, kesik çıktı, ESKİ işareti, sızan `<<<<<<<`/`=======`), G2 yol (var/kapsam/yasak: `.git*`, `.github`, `pubspec.lock`, `.env*`, anahtar/sertifika, `..`, mutlak yol, büyük-küçük harf çakışması), G3 eşleşme, G4 büyüklük (yama/dosya sayısı, diff, ESKİ uzunluğu, büyük silme, dosya boşaltma, >80 satır silme), G5 sözdizimi/regresyon (parantez dengesi + `FlutterProjectKit.check` yeni hata; pubspec bozulması), G6 import (dart: bilinen, package: pubspec'te bildirilmiş/kendi paketi, göreli dosya var; kaldırılan paket hâlâ import ediliyor mu), G7 boş/dejenere/tekrar, G8 sır kalıpları + kayıtlı sır + ilgisiz yere süreç/ağ çağrısı.
+  - `parseVerifier` (KATI: yalnızca ilk satır tam `KARAR: ONAY`, tek KARAR, ≤3 `-` gerekçe; metinde `KARAR: RED` varsa RED; belirsiz/boş = RED, kapı V2), `VerifierPolicy.choose/chooseDetailed/providerOf`.
+- `lib/application/dev_ledger.dart` (YENİ): `DevErrorEntry`, `DevLedger` (JSONL, boyut sınırlı döndürme `.1`, bozuk satır toleransı, sır maskeleme), `ModelTrust` (EWMA, histerezis, `dev_trust.json` AtomicFile).
+- `lib/application/dev_mode.dart` (yalnızca EKLEME): `DevPrompts.verifierSystem/verifierUser/withLessons`, `analystUser/fixerUser/ciFixerUser/improverUser` için isteğe bağlı `lessons` (boşsa metin DEĞİŞMEZ); `DevPatcher.apply(onReject:)` ve `DevPatcher.gateOfReason`.
+- Testler: `test/dev_guard_test.dart`, `test/dev_ledger_test.dart`. 200 betikli kötü çıktı + her kesik önek + 300 rastgele bozulma → hiçbiri ok dönmez (test çıktısına `GEÇERSİZ ÇIKTI: n/200` yazılır).
 
-### Kimi çıktısına yapılan düzeltmeler
-- Testlerdeki `package:kripton/...` importları `package:kripton_ai/...` yapıldı (paket adı `kripton_ai`).
-- G5/G6: `FlutterProjectKit.check` artık `base:` (tüm dosya kümesi/pubspec) ile çağrılır (`DevPatcher.regression` ile aynı), böylece pubspec'te bildirilmiş paket yanlışlıkla "bilinmeyen" sayılmaz. `check()` gerçek `snap`'i, `checkFiles` verilmezse `ProjectSnapshot(name:'guard', text: files)` kullanır.
-- G8: `_suspicious` regex'inin sonundaki `\b`, `HttpClient()` gibi `(` ile biten kalıpları hiç eşleştirmiyordu; kaldırıldı. Dosyada zaten aynı türde çağrı varsa (mevcut kalıp) yeni sayılmaz. İlgili test mantığı buna göre düzeltildi ve "yeni HttpClient() eklenemez" testi eklendi.
-- Yama uygulaması `replaceFirst` yerine dilimleme (G3 tek eşleşmeyi garanti eder).
-
-### Public API (sonraki agent için)
+### Public API
 ```dart
-// lib/application/dev_guard.dart
-class GuardViolation { String gate, path, detail; }  class GuardVerdict { List<GuardViolation> violations; bool get ok; }
-typedef GuardRecorder = void Function(GuardViolation);
-class DevGuard {
-  static GuardVerdict check(ProjectSnapshot snap, DevRoundPlan plan, String rawOutput, {GuardRecorder? record});
-  static GuardVerdict checkFiles({required Map<String,String> files, required Set<String> scope, required String rawOutput, GuardRecorder? record, ProjectSnapshot? base});
-  static String? pathProblem(String path, Map<String,String> files, Set<String> scope, {required bool isNew});
-  static String? matchProblem(String content, String old);  static String? degenerateProblem(String text);
-}
-// lib/application/dev_ledger.dart
-class DevLedger { DevLedger({LedgerStore? store, int maxFileBytes, int Function()? nowMs}); static Future<DevLedger> open({...});
-  Future<DevErrorEntry> record({required String role, required String modelId, required String gate, required String detail, String path, int attempt});
-  List<DevErrorEntry> get entries; Map<String,int> statsByModel(); Map<String,int> statsByGate(); String lessons({int maxChars = 600}); }
-class FileLedgerStore implements LedgerStore { FileLedgerStore(String path); }
-class ModelTrust { observe(modelId, rejected); rate; samplesOf; demoteRecommended; promoteRecommended; isDemoted; markDemoted; markPromoted; }
-// lib/application/dev_mode.dart
-DevPrompts.lessons; DevPrompts.lessonsBlock(); DevPrompts.verifierSystem; DevPrompts.verifierUser(finding, diff); DevPrompts.parseVerifier(raw);
-VerifierPolicy.choose(fixerModel, candidates) -> String? (null => RED);  DevPatcher.onReject
+// dev_guard.dart
+class DevGate { static const internal='G0', format='G1', path='G2', match='G3', size='G4', regression='G5', imports='G6', degenerate='G7', suspicious='G8', verifierRed='V1', verifierUnparsable='V2', ci='C1'; static String title(String); static String advice(String); }
+class DevGuardLimits { const DevGuardLimits({maxPatches=12, maxChangedFiles=8, maxOutputChars=200000, maxOldBlockLines=80, maxDiffChars=24000, maxNewFileChars=40000, maxRemovedLinesPerFile=80, minShrinkBaseChars=400, minShrinkKeepRatio=0.5, maxPathLength=200}); }
+class GuardViolation { String code, detail, path; int? patchIndex; }
+final class GuardVerdict { bool get ok; List<GuardViolation> violations; Map<String,String> changes; List<GuardHunk> hunks; Set<String> get gates; List<String> get changedPaths; String get summary; String diffText({int maxChars=6000}); }
+DevGuard.check(ProjectSnapshot snap, {required Set<String> scope /*plan.paths*/, required String rawOutput, String finding='', DevGuardLimits limits}) -> GuardVerdict
+DevGuard.degenerateProblem(String, {minLines, minUniqueRatio}) -> String?
+VerifierVerdict parseVerifier(String raw); // {approved, parsed, reasons, problem, gate}
+VerifierPolicy.choose(String fixer, Iterable<String> candidates, {Set<String> avoid, String Function(String)? providerOf}) -> String?
+VerifierPolicy.chooseDetailed(...) -> VerifierChoice? {modelId, differentProvider}
+// dev_ledger.dart
+class DevRole { analyst, fixer, verifier }
+class DevErrorEntry { DevErrorEntry({ts, rol, modelId, kapiKodu, ayrinti, dosya='', deneme=0}); toJson(); static tryParse(Object?); }
+class ModelTrust { observe(id,{rejected}); rate(id); samples(id); isDemoted(id); Set<String> demoted(); toJson(); loadJson(Object?); }
+class DevLedger { DevLedger({Directory? dir, fileName, maxFileBytes=256KB, maxMemoryEntries=500, ModelTrust? trust, now});
+  Future<void> load(); record(DevErrorEntry); recordVerdict(GuardVerdict,{rol,modelId,deneme}); recordVerifier(VerifierVerdict,{fixerModelId,verifierModelId,dosya,deneme}); recordSuccess({modelId}); flush();
+  Map<String,int> statsByModel(); statsByGate(); String lessons({int maxChars=600}); ModelTrust trust; int corruptLines, writeFailures; }
+// dev_mode.dart
+DevPrompts.verifierSystem; verifierUser(finding, diff,{maxFindingChars,maxDiffChars}); withLessons(system, lessons);
+DevPatcher.apply(..., onReject: (path, gate, detail) {}); DevPatcher.gateOfReason(reason,{fallback='G2'});
 ```
-- Kullanım: orkestratör (Görev 6) her ihlali `DevGuard.check(..., record: (v) => ledger.record(role:'fixer', modelId:..., gate: v.gate, detail: v.detail, path: v.path))` ile deftere yazar, `DevPrompts.lessons = ledger.lessons().split('\n')` ile derse çevirir, `DevPatcher.onReject`'i deftere bağlar. Doğrulayıcı model yoksa (`VerifierPolicy.choose` null) yama RED sayılır.
+- Önerilen akış: `GuardVerdict v = DevGuard.check(...)`; `!v.ok` → `ledger.recordVerdict(...)`, yeniden iste (`DevPrompts...lessons: ledger.lessons()`); `ok` → `VerifierPolicy.choose(fixer, adaylar, avoid: ledger.trust.demoted())` null ise COMMIT ETME; doğrulayıcıya `verifierUser(bulgu, v.diffText())`; `parseVerifier(...).approved` değilse `ledger.recordVerifier` ve commit yok; onayda `commitChanges(branch, sha, v.changes, ...)`.
 
 ### DOĞRULANAMADI
-- `dart format`, `flutter analyze`, `flutter test` ÇALIŞTIRILAMADI (ortamda Dart/Flutter SDK yok, SDK indirme engelli). Hiçbir yeni kod derlenmedi/çalıştırılmadı.
-- `FlutterProjectKit.check`'in `base:` ile çağrıldığında yalnızca üretilen dosyalar için mi tüm proje için mi sorun döndürdüğü; G6 ve "hata sayısı artmadıkça geçer" testleri buna bağlı olabilir.
-- `ghp_abcdefghijklmnop1234` örneği `SecretMask` kalıbıyla (`gh[pousr]_` + en az 16 karakter) maskelenir; testin geçmesi buna bağlı.
-- `ModelTrust` EWMA sayıları (5 ret → demote, ardından 5 kabul → oran ≤ 0.2) elle hesaplandı, çalıştırılmadı.
+- `dart format`, `flutter analyze`, `flutter test` ÇALIŞTIRILAMADI (ortamda Dart/Flutter SDK yok). Kod ve testler DERLENMEDİ/ÇALIŞTIRILMADI; yalnızca elle gözden geçirildi. "200/200 reddedildi" çıktısı henüz üretilmedi.
+- `_BoomSnapshot implements ProjectSnapshot` (noSuchMethod) testinin analyzer'dan geçeceği; `switch` ifadesi/kayıt (record) sözdizimi SDK 3.5 ile derlenmesi.
+- Gerçek model çıktılarında G8 kalıplarının yanlış pozitif oranı; `cloud-auto` arkasındaki gerçek sağlayıcı (doğrulayıcı bağımsızlığı garanti edilemez).
 
 ### Bilinen riskler
-- `DevPrompts.lessons` ve `DevPatcher.onReject` statik/global alanlardır; eşzamanlı birden fazla oturum aynı alanı paylaşır (testlerde sıfırlanır).
-- Kapılar `DevPatcher` ile kısmen aynı kontrolleri tekrar eder; sonraki görevde tek akışa bağlanmalı (kopyalama değil çağrı).
-- Test zayıflatma, korumalı yol (DevPolicy) ve değişiklik bütçesi kapıları henüz YOK (Görev 11).
+- G3 kasıtlı olarak ESKİ'yi bulanık eşleştirmez; CRLF dosyada LF'li ESKİ reddedilir (güvenli yön, ama çok ret üretebilir).
+- G8 sır kalıpları `SecretMask`'ın özel listesinin KOPYASIDIR (özel olduğundan); `SecretMask` değişirse güncellenmeli. `Bearer`/`api_key=` kalıpları bilerek alınmadı (Dart kodunda yanlış pozitif).
+- G5 yeni hata saptaması `FlutterProjectKit.check` ile sınırlıdır (tür/ad çözümlemesi yok); gerçek doğrulama CI'dır (`C1`).
+- Doğrulayıcı kendisi de bir model: prompt-injection riskine karşı diff "veri" olarak tanımlandı ve ONAY katıdır, ama garanti değildir.
+- Defter dosyası yazma hatalarında sessizce `writeFailures` sayar; `Storage` dizin yolunu vermediği için çağıran `Directory` seçmelidir (öneri: `<belgeler>/devlogs`).
