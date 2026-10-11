@@ -2,6 +2,7 @@
 name: kripton_ai
 description: Kripton Yapay Zekâ Agent
 publish_to: none
+repository: https://github.com/TwilightStarr/Kripton
 version: 1.4.0+5
 
 environment:

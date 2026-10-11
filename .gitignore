@@ -5,3 +5,23 @@ build/
 pubspec.lock
 android/.gradle/
 android/local.properties
+
+# IDE / OS
+.idea/
+*.iml
+.DS_Store
+*.log
+
+# Derleme çıktıları ve imzalama (asla commit etmeyin)
+*.apk
+*.aab
+*.jks
+*.keystore
+android/key.properties
+android/.gradle/
+dist/
+
+# Yerel gizli ayarlar / yerel model dosyaları
+cloud_config.json
+.env
+*.gguf

@@ -1,5 +1,11 @@
 # Kripton
 
+[![Lisans: MIT](https://img.shields.io/badge/lisans-MIT-blue.svg)](LICENSE)
+![Platform: Android arm64](https://img.shields.io/badge/platform-Android%20arm64-green.svg)
+![Flutter](https://img.shields.io/badge/Flutter-stable-02569B.svg)
+
+**Türkçe** · [English](README.en.md)
+
 **Telefonunda tamamen yerel çalışan çok ajanlı yapay zekâ stüdyosu.**
 
 Kripton, Android için geliştirilmiş bir Flutter uygulamasıdır. GGUF biçimindeki dil modellerini
@@ -28,6 +34,9 @@ kendi (ücretsiz) API anahtarını girerek çok daha güçlü **bulut motorları
 - [Proje yapısı](#proje-yapısı)
 - [Test](#test)
 - [Bilinen sınırlamalar](#bilinen-sınırlamalar)
+- [Sorumluluk reddi](#sorumluluk-reddi)
+- [Katkı ve güvenlik](#katkı-ve-güvenlik)
+- [Lisans](#lisans)
 
 ---
 
@@ -123,6 +132,19 @@ Akış ve Geliştirme modlarından bağımsız, çevrimdışı sohbet.
 
 Seçilen model için gerçek tok/sn ölçümü yapar; ölçümler katalogdaki tahmini değerlerin yerine gösterilir.
 
+### 6. Flutter modu (GitHub Actions ile gerçek analyze / derleme)
+
+Geliştirme Modu'nda **Flutter modu** açılınca proje, ayrı bir dala (varsayılan `kripton-ci`) tek commit olarak
+gönderilir; Actions'ta sırayla `flutter pub get`, `flutter analyze`, `flutter test` ve `flutter build apk --debug`
+çalışır. Başarısız aşamanın çıktısı **kırpılmadan** 2. AI'ya verilir; bağlama sığmayan çıktı satır sınırlarında
+kayıpsız parçalara bölünür. Otonom modda proje, GitHub'da temiz geçmeden "kararlı" sayılmaz; ağ/kota/iptal
+durumlarında üstel geri çekilmeyle beklenir ve yeniden denenir.
+
+- Token: classic için `repo` + `workflow`; fine-grained için Contents RW, Actions R, Workflows RW.
+- Depoda en az bir commit olmalı. `main` dalına dokunulmaz; kontrol dalı her seferinde sıfırdan yazılır.
+- Projede `tool/ci_prebuild.sh` varsa derlemeden önce çalıştırılır (ör. llama.cpp kaynağını çekmek için).
+- `flutter analyze` bilgi (info) düzeyi notlar düzeltmeye gönderilmez; hata ve uyarılar gönderilir.
+
 ---
 
 ## Desteklenen modeller
@@ -141,6 +163,10 @@ ve GGUF başlığı doğrulanır. Her model için cihaz RAM'ine uygunluk rozeti 
 | Mistral 7B Instruct v0.3 | Q5_K_M | ~4,8 GB | ~5,6 GB |
 | Llama 3.2 3B Instruct | Q4_K_M | ~2,1 GB | ~2,7 GB |
 | Phi-3.5 Mini Instruct 3.8B | Q4_K_M | ~2,3 GB | ~2,9 GB |
+
+> **Model lisansları:** Kripton model dosyası dağıtmaz; modeller sizin cihazınıza Hugging Face'ten indirilir ve
+> her model kendi lisansına tabidir (ör. Qwen 2.5 Coder 3B ticari kullanıma kısıtlıdır, Llama 3.2 atıf ister).
+> Ayrıntı: [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md#4-yapay-zekâ-modelleri-depoda-ve-apk-içinde-yok).
 
 Tok/sn değerleri cihaza göre büyük farklar gösterir; uygulama içindeki Hız testi ile kendi cihazınızda ölçün.
 
@@ -165,7 +191,7 @@ Her sürümle birlikte bir `.sha256` dosyası yayınlanır; indirdiğiniz APK'y�
 ### Kaynaktan derleme
 
 ```bash
-git clone <depo-adresi>
+git clone https://github.com/TwilightStarr/Kripton.git
 cd Kripton
 ./kurulum.sh
 flutter run --release
@@ -277,7 +303,10 @@ lib/
 test/              Birim ve uçtan uca testler (sahte motorla)
 tool/              pack_self_source.sh (kendi kaynak paketini üretir)
 assets/            Yazı tipleri ve gömülü kaynak paketi
+docs/              Geliştirme notları (sağlamlaştırma değişiklikleri)
 .github/workflows/ APK derleme ve yayınlama
+LICENSE            MIT lisansı
+THIRD_PARTY_NOTICES.md  Üçüncü taraf lisans bildirimleri
 ```
 
 Kullanılan başlıca paketler: `flutter_riverpod`, `flutter_llama`, `archive`, `pdf`, `background_downloader`,
@@ -296,7 +325,7 @@ flutter analyze
 flutter test
 ```
 
-`test/` altında 28 test dosyasında, gerçek model yerine sahte motor kullanan birim ve uçtan uca testler bulunur
+`test/` altında 41 test dosyasında, gerçek model yerine sahte motor kullanan birim ve uçtan uca testler bulunur
 (doğrulayıcı, akış çalıştırıcı, bütçe, bellek planı, indirme doğrulama, sohbet hafızası, geliştirme modu vb.).
 Sahte motorlu testler model kalitesini veya gerçek cihaz davranışını ölçmez.
 
@@ -319,15 +348,24 @@ Sahte motorlu testler model kalitesini veya gerçek cihaz davranışını ölçm
 - **Donanım:** Yalnızca `arm64-v8a` desteklenir, çıkarım CPU üzerinde yapılır (GPU/Vulkan yoktur). Sade Mod'un kazancı
   arayüz tarafıyla sınırlıdır; modelin kendi RAM kullanımı değişmez.
 
-## Flutter modu (GitHub Actions ile gerçek analyze / derleme)
+---
 
-Geliştirme Modu'nda **Flutter modu** açılınca proje, ayrı bir dala (varsayılan `kripton-ci`) tek commit olarak
-gönderilir; Actions'ta sırayla `flutter pub get`, `flutter analyze`, `flutter test` ve `flutter build apk --debug`
-çalışır. Başarısız aşamanın çıktısı **kırpılmadan** 2. AI'ya verilir; bağlama sığmayan çıktı satır sınırlarında
-kayıpsız parçalara bölünür. Otonom modda proje, GitHub'da temiz geçmeden "kararlı" sayılmaz; ağ/kota/iptal
-durumlarında üstel geri çekilmeyle beklenir ve yeniden denenir.
+## Sorumluluk reddi
 
-- Token: classic için `repo` + `workflow`; fine-grained için Contents RW, Actions R, Workflows RW.
-- Depoda en az bir commit olmalı. `main` dalına dokunulmaz; kontrol dalı her seferinde sıfırdan yazılır.
-- Projede `tool/ci_prebuild.sh` varsa derlemeden önce çalıştırılır (ör. llama.cpp kaynağını çekmek için).
-- `flutter analyze` bilgi (info) düzeyi notlar düzeltmeye gönderilmez; hata ve uyarılar gönderilir.
+- Yazılım **olduğu gibi** sunulur, hiçbir garanti verilmez ([LICENSE](LICENSE)).
+- Yapay zekâ modelleri yanılabilir; ürettikleri kod, belge ve düzeltmeleri kullanmadan önce kendiniz inceleyin ve test edin.
+- Geliştirme Modu proje dosyalarınızı değiştirir; önemli projelerinizin yedeğini alın.
+- Bulut motorunu veya GitHub token'ını kullanırsanız, verileriniz ilgili hizmetin koşullarına tabidir.
+- Kripton; Google, Groq, OpenRouter, GitHub, Hugging Face, Meta, Alibaba (Qwen), Mistral AI, DeepSeek veya Microsoft
+  ile bağlantılı değildir ve onlar tarafından onaylanmamıştır. Tüm marka adları ilgili sahiplerine aittir.
+
+## Katkı ve güvenlik
+
+- Katkı rehberi: [CONTRIBUTING.md](CONTRIBUTING.md)
+- Güvenlik açığı bildirimi: [SECURITY.md](SECURITY.md)
+
+## Lisans
+
+Kripton kaynak kodu [MIT lisansı](LICENSE) ile yayınlanır. Üçüncü taraf bileşenler (llama.cpp, yazı tipleri,
+Dart/Flutter paketleri) ve yapay zekâ modelleri kendi lisanslarına tabidir:
+[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
