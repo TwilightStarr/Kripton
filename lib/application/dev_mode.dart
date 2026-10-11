@@ -431,6 +431,22 @@ class DevReport {
 class DevPrompts {
   const DevPrompts._();
 
+  /// Sonraki isteklere eklenecek kısa ders listesi (DevLedger.lessons çıktısı satırları).
+  /// Varsayılan boş; [lessonsBlock] bunu istek metnine ekler.
+  static List<String> lessons = const [];
+
+  static String lessonsBlock({int maxChars = 600}) {
+    if (lessons.isEmpty) return '';
+    final b = StringBuffer('\n--- ÖNCEKİ HATALARDAN KAÇIN ---\n');
+    var used = 0;
+    for (final l in lessons) {
+      if (used + l.length > maxChars) break;
+      b.writeln('- $l');
+      used += l.length + 2;
+    }
+    return b.toString();
+  }
+
   static const String analystSystem =
       'Sen kıdemli bir Flutter/Dart kod denetçisisin. Kod YAZMA, düzeltme YAPMA; yalnızca verilen koddaki '
       'GERÇEK sorunları bul: derleme hataları, null-safety, eksik veya yanlış import, await/async hataları, '
@@ -478,7 +494,8 @@ class DevPrompts {
     return 'TUR $round. KULLANICI HEDEFİ: $goal\n\n'
         'Projedeki dosyalar (import kontrolü için): ${_fileList(snap)}\n'
         '${deps.isEmpty ? '' : '$deps\n'}\n'
-        'KOD:\n${plan.codeBlock}';
+        'KOD:\n${plan.codeBlock}'
+        '${lessonsBlock()}';
   }
 
   static String _depLine(ProjectSnapshot snap) {
@@ -518,7 +535,8 @@ class DevPrompts {
     return 'TUR $round/$total. Aşağıdaki kod bölümünü denetle ve sorunları bildir.\n\n'
         'Projedeki dosyalar (import kontrolü için): ${_fileList(snap)}\n'
         '${deps.isEmpty ? '' : '$deps\n'}\n'
-        'KOD:\n${plan.codeBlock}';
+        'KOD:\n${plan.codeBlock}'
+        '${lessonsBlock()}';
   }
 
   /// Flutter modu: gerçek araç çıktısı ([toolOutput], hiç kırpılmadan) ile 2. AI'ya giden metin.
@@ -535,7 +553,39 @@ class DevPrompts {
       'AŞAĞIDAKİ HATA RAPORUNDAKİ sorunları düzelt.\n\n'
       'RAPOR:\n${report.forFixer()}\n\n'
       'KOD:\n${plan.codeBlock}\n'
-      '${WorkflowRunner.patchFormatInstruction}';
+      '${WorkflowRunner.patchFormatInstruction}'
+      '${lessonsBlock()}';
+
+  /// Doğrulayıcı (3. AI) sistem metni. Yanıt KATI biçimdedir; ayrıştırılamayan yanıt RED sayılır.
+  static const String verifierSystem =
+      'Sen bağımsız bir kod denetçisisin. Sana bir hata bulgusu ve bir yama (ESKİ/YENİ blok) verilir. '
+      'Yamanın güvenli olup olmadığına yalnızca verilen bilgiyle karar ver.\n'
+      'RED nedenleri: yama uydurma/kapsam dışı dosyaya dokunur; ESKİ blok verilen koda benzemiyor; '
+      'çalışan kodu gereksizce siler veya sözdizimini bozar; sır/token benzeri dize ekler; '
+      'pubspec\'te olmayan paket import eder.\n'
+      'Yanıtın YALNIZCA şu biçimde olsun, başka hiçbir şey yazma:\n'
+      'KARAR: ONAY\n'
+      'veya\n'
+      'KARAR: RED\n'
+      'neden 1\n'
+      'neden 2\n'
+      'neden 3\n'
+      'En çok 3 gerekçe satırı yaz.';
+
+  static String verifierUser(String finding, String diff) =>
+      'BULGU:\n$finding\n\nYAMA:\n$diff\n\nKARAR ver (KARAR: ONAY veya KARAR: RED + en çok 3 gerekçe).';
+
+  /// Doğrulayıcı yanıtını ayrıştırır. Ayrıştırılamaz, belirsiz (çelişen/çoklu KARAR) veya boş = RED (false).
+  static bool parseVerifier(String raw) {
+    if (raw.trim().isEmpty) return false;
+    final ms = RegExp(
+      r'^\s*KARAR\s*:\s*(ONAY|RED)\b',
+      caseSensitive: false,
+      multiLine: true,
+    ).allMatches(raw);
+    if (ms.length != 1) return false;
+    return ms.first.group(1)!.toUpperCase() == 'ONAY';
+  }
 }
 
 /// 2. AI'nın yamalarının sonucu.
@@ -557,6 +607,9 @@ class DevPatchOutcome {
 /// Yamaları güvenle uygular: kapsam, boyut ve derleme-regresyon denetimi yapar.
 class DevPatcher {
   const DevPatcher._();
+
+  /// Ret/geri alma anında çağrılır (DevLedger kaydı). null ise etkisiz.
+  static void Function(String path, String reason)? onReject;
 
   static PatchBlock _withPath(PatchBlock p, String path) => path == p.filePath
       ? p
@@ -622,6 +675,7 @@ class DevPatcher {
       if (why != null) {
         rejected++;
         notes.add('Reddedildi (${patch.filePath}): $why');
+        onReject?.call(patch.filePath, why);
         continue;
       }
       var r = WorkflowRunner.applyPatch(patch, ws);
@@ -649,6 +703,7 @@ class DevPatcher {
       } else {
         rejected++;
         notes.add('Uygulanamadı (${patch.filePath}): ${r.error ?? 'eşleşmedi'}');
+        onReject?.call(patch.filePath, r.error ?? 'eşleşmedi');
       }
     }
     final changed = <String, String>{};
@@ -659,6 +714,7 @@ class DevPatcher {
       if (problem != null) {
         rejected++;
         notes.add('Geri alındı (${e.key}): $problem');
+        onReject?.call(e.key, problem);
         continue;
       }
       changed[e.key] = e.value;
@@ -700,6 +756,29 @@ class DevPatcher {
           RegExp(r'^name:\s*\S+', multiLine: true).hasMatch(after) &&
           RegExp(r'^dependencies:', multiLine: true).hasMatch(after);
       if (!ok) return 'pubspec.yaml bozuldu (name/dependencies yok)';
+    }
+    return null;
+  }
+}
+
+/// Doğrulayıcı model politikası: yamayı yazan modelden FARKLI sağlayıcıdan doğrulayıcı seçer.
+class VerifierPolicy {
+  const VerifierPolicy._();
+
+  static String _providerOf(String modelId) {
+    final i = modelId.indexOf('/');
+    return i > 0 ? modelId.substring(0, i) : modelId;
+  }
+
+  /// Önce farklı sağlayıcıdan, yoksa farklı modelden aday döner. Hiçbiri yoksa null
+  /// (çağıran bunu RED saymalı: bağımsız doğrulayıcı yoksa yama geçemez).
+  static String? choose(String fixerModel, List<String> candidates) {
+    final fp = _providerOf(fixerModel);
+    for (final c in candidates) {
+      if (_providerOf(c) != fp) return c;
+    }
+    for (final c in candidates) {
+      if (c != fixerModel) return c;
     }
     return null;
   }

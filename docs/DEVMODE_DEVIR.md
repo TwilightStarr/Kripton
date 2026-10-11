@@ -173,3 +173,52 @@ class GithubCiRunner {
 - `CiFeedback`: hata satırları bütçeyi aşsa bile kırpılmaz (`overBudget`); model bağlamı çağıran tarafından ayrıca denetlenmeli. Ayrıştırılamayan aşamada hata benzeri satırlar (error/failed/hata...) hiç atılmaz.
 - Test aşaması: `[E]` bloğu bulunamazsa eski toplu davranış (tek tanı) kalır; hiçbir tanı çıkmazsa `CiFeedback` aşama çıktısını ham verir.
 - `ci_batch.dart` (`CiBatcher`) başarısız test/derleme tanılarını artık tek tek alır; proje dışı yol (`test/...` yoksa) `unmatched` olur.
+
+
+## GÖREV 4/10: Doğrulama kapıları, doğrulayıcı AI ve hata defteri
+
+### Yapılanlar
+- `lib/application/dev_guard.dart` (YENİ, Kimi çıktısı + düzeltmeler): `DevGuard` kapıları G1-G8; `GuardViolation`, `GuardVerdict`, `kGateDescriptions`.
+- `lib/application/dev_ledger.dart` (YENİ): `DevErrorEntry`, `LedgerStore`, `MemoryLedgerStore`, `FileLedgerStore`, `DevLedger` (kayıt, JSONL döndürme, istatistik, `lessons`), `ModelTrust`. Kimi yalnızca imzaları ve testi vermişti; dosya imzalara ve teste göre yazıldı.
+- `lib/application/dev_mode.dart`: `DevPrompts.lessons/lessonsBlock`, `verifierSystem/verifierUser/parseVerifier`, `VerifierPolicy.choose`, `DevPatcher.onReject` kancası (3 yerde çağrılır). `analystUser`, `improverUser` ve `fixerUser` sonuna `lessonsBlock()` eklendi (ders yoksa boş; mevcut metinler değişmez).
+- Testler: `test/dev_guard_test.dart`, `test/dev_ledger_test.dart`.
+
+### Kimi çıktısına yapılan düzeltmeler
+- Testlerdeki `package:kripton/...` importları `package:kripton_ai/...` yapıldı (paket adı `kripton_ai`).
+- G5/G6: `FlutterProjectKit.check` artık `base:` (tüm dosya kümesi/pubspec) ile çağrılır (`DevPatcher.regression` ile aynı), böylece pubspec'te bildirilmiş paket yanlışlıkla "bilinmeyen" sayılmaz. `check()` gerçek `snap`'i, `checkFiles` verilmezse `ProjectSnapshot(name:'guard', text: files)` kullanır.
+- G8: `_suspicious` regex'inin sonundaki `\b`, `HttpClient()` gibi `(` ile biten kalıpları hiç eşleştirmiyordu; kaldırıldı. Dosyada zaten aynı türde çağrı varsa (mevcut kalıp) yeni sayılmaz. İlgili test mantığı buna göre düzeltildi ve "yeni HttpClient() eklenemez" testi eklendi.
+- Yama uygulaması `replaceFirst` yerine dilimleme (G3 tek eşleşmeyi garanti eder).
+
+### Public API (sonraki agent için)
+```dart
+// lib/application/dev_guard.dart
+class GuardViolation { String gate, path, detail; }  class GuardVerdict { List<GuardViolation> violations; bool get ok; }
+typedef GuardRecorder = void Function(GuardViolation);
+class DevGuard {
+  static GuardVerdict check(ProjectSnapshot snap, DevRoundPlan plan, String rawOutput, {GuardRecorder? record});
+  static GuardVerdict checkFiles({required Map<String,String> files, required Set<String> scope, required String rawOutput, GuardRecorder? record, ProjectSnapshot? base});
+  static String? pathProblem(String path, Map<String,String> files, Set<String> scope, {required bool isNew});
+  static String? matchProblem(String content, String old);  static String? degenerateProblem(String text);
+}
+// lib/application/dev_ledger.dart
+class DevLedger { DevLedger({LedgerStore? store, int maxFileBytes, int Function()? nowMs}); static Future<DevLedger> open({...});
+  Future<DevErrorEntry> record({required String role, required String modelId, required String gate, required String detail, String path, int attempt});
+  List<DevErrorEntry> get entries; Map<String,int> statsByModel(); Map<String,int> statsByGate(); String lessons({int maxChars = 600}); }
+class FileLedgerStore implements LedgerStore { FileLedgerStore(String path); }
+class ModelTrust { observe(modelId, rejected); rate; samplesOf; demoteRecommended; promoteRecommended; isDemoted; markDemoted; markPromoted; }
+// lib/application/dev_mode.dart
+DevPrompts.lessons; DevPrompts.lessonsBlock(); DevPrompts.verifierSystem; DevPrompts.verifierUser(finding, diff); DevPrompts.parseVerifier(raw);
+VerifierPolicy.choose(fixerModel, candidates) -> String? (null => RED);  DevPatcher.onReject
+```
+- Kullanım: orkestratör (Görev 6) her ihlali `DevGuard.check(..., record: (v) => ledger.record(role:'fixer', modelId:..., gate: v.gate, detail: v.detail, path: v.path))` ile deftere yazar, `DevPrompts.lessons = ledger.lessons().split('\n')` ile derse çevirir, `DevPatcher.onReject`'i deftere bağlar. Doğrulayıcı model yoksa (`VerifierPolicy.choose` null) yama RED sayılır.
+
+### DOĞRULANAMADI
+- `dart format`, `flutter analyze`, `flutter test` ÇALIŞTIRILAMADI (ortamda Dart/Flutter SDK yok, SDK indirme engelli). Hiçbir yeni kod derlenmedi/çalıştırılmadı.
+- `FlutterProjectKit.check`'in `base:` ile çağrıldığında yalnızca üretilen dosyalar için mi tüm proje için mi sorun döndürdüğü; G6 ve "hata sayısı artmadıkça geçer" testleri buna bağlı olabilir.
+- `ghp_abcdefghijklmnop1234` örneği `SecretMask` kalıbıyla (`gh[pousr]_` + en az 16 karakter) maskelenir; testin geçmesi buna bağlı.
+- `ModelTrust` EWMA sayıları (5 ret → demote, ardından 5 kabul → oran ≤ 0.2) elle hesaplandı, çalıştırılmadı.
+
+### Bilinen riskler
+- `DevPrompts.lessons` ve `DevPatcher.onReject` statik/global alanlardır; eşzamanlı birden fazla oturum aynı alanı paylaşır (testlerde sıfırlanır).
+- Kapılar `DevPatcher` ile kısmen aynı kontrolleri tekrar eder; sonraki görevde tek akışa bağlanmalı (kopyalama değil çağrı).
+- Test zayıflatma, korumalı yol (DevPolicy) ve değişiklik bütçesi kapıları henüz YOK (Görev 11).
