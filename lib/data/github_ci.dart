@@ -1,13 +1,22 @@
+// Değişiklik (Görev 3/10): workflowYaml sabitlendi (push yalnızca kripton/**, concurrency, sabit Flutter/action sürümleri);
+// GithubHttpRequest.followRedirects eklendi; CiResult'a exitCode/incomplete eklendi; CiLogParser test aşaması
+// başarısız testleri tek tek ayrıştırır; yeni GithubCiRunner (ensureWorkflow + run bulma/yoklama/log indirme),
+// CiLogStore (maskeli, boyut sınırlı ham log). push() ve GithubCi.check KULLANILMAYACAK (eski yol; davranışı değişmedi).
 // Değişiklik (Görev 2/10): GithubHttpRequest/GithubHttpResponse/GithubHttpSender, githubHttpSend ve githubRetryAfterFrom paylaşıma eklendi (yalnızca ekleme; push() ve GithubCi'ye dokunulmadı).
 // Flutter modu: projeyi GitHub'a (özel bir dala) gönderir, Actions üzerinde GERÇEK
 // `flutter pub get` / `flutter analyze` / `flutter test` / `flutter build apk` çalıştırır ve
 // araç çıktısını AYNEN (kırpmadan) geri okur. Yeni paket gerekmez (dart:io HttpClient).
+import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 
 import 'package:crypto/crypto.dart';
+import 'package:path/path.dart' as pth;
 
+import 'atomic_file.dart';
+import 'ci_feedback.dart';
 import 'crash_guard.dart';
+import 'github_repo.dart';
 import 'project_snapshot.dart';
 import 'secret_mask.dart';
 import 'secret_store.dart';
@@ -208,7 +217,17 @@ class CiResult {
     this.stageLog = '',
     this.runUrl = '',
     this.infoCount = 0,
+    this.exitCode,
+    this.incomplete = false,
   });
+
+  /// Başarısız aşamanın çıkış kodu; aşama bitiş işaretçisi olmadan kesildiyse ([incomplete]) veya aşama
+  /// bilinmiyorsa null.
+  final int? exitCode;
+
+  /// Aşama başladı ama `##KRIPTON-END` yazılmadı (runner kaybı, zaman aşımı, süreç öldürüldü): kod hatası DEĞİL,
+  /// altyapı sorunudur.
+  final bool incomplete;
 
   /// Tüm aşamalar (pub get, analyze, test, build) başarılı mı?
   final bool ok;
@@ -317,7 +336,113 @@ class CiLogParser {
       stageLog: text,
       runUrl: runUrl,
       infoCount: parsed.infoCount,
+      exitCode: failed.exitCode,
+      incomplete: failed.exitCode == null,
     );
+  }
+
+  /// Aşama çıktısındaki `info` satırları (analyze), AYNEN. [parseStage] bunları sorun saymaz, yalnızca sayar.
+  static List<String> infoLines(String stageLog) {
+    final out = <String>[];
+    for (final l in stageLog.split('\n')) {
+      final a = _analyze.firstMatch(l);
+      if (a != null && a.group(1) == 'info') out.add(l.trimRight());
+    }
+    return out;
+  }
+
+  // "00:02 +0 -1: test/a_test.dart: addition fails [E]"
+  static final RegExp _testProgress = RegExp(r'^\d\d:\d\d(?::\d\d)? \+\d+(?: ~\d+)?(?: -\d+)?: (.*)$');
+  static final RegExp _testStackFrame = RegExp(r'(?<![A-Za-z0-9_./-])(test/[A-Za-z0-9_./-]+\.dart)(?:\s+|:)(\d+):(\d+)');
+  static final RegExp _pkgFrameAny = RegExp(r'package:([A-Za-z0-9_]+)/([A-Za-z0-9_./-]+\.dart)(?:\s+|:)(\d+):(\d+)');
+  static const Set<String> _foreignPackages = <String>{
+    'matcher',
+    'flutter_test',
+    'flutter',
+    'test_api',
+    'test_core',
+    'test',
+    'stack_trace',
+    'async',
+    'fake_async',
+    'collection',
+    'meta',
+    'vector_math',
+  };
+
+  /// `flutter test` çıktısından başarısız testleri ([E] ile biten ilerleme satırı + devamı) tek tek çıkarır.
+  /// Hiç [E] bloğu bulunamazsa boş döner (çağıran toplu davranışa düşer).
+  static List<CiDiagnostic> _failedTests(List<String> lines) {
+    final out = <CiDiagnostic>[];
+    var i = 0;
+    while (i < lines.length) {
+      final m = _testProgress.firstMatch(lines[i]);
+      if (m == null || !m.group(1)!.trimRight().endsWith('[E]')) {
+        i++;
+        continue;
+      }
+      var title = m.group(1)!.trimRight();
+      title = title.substring(0, title.length - 3).trimRight();
+      final block = <String>[lines[i].trimRight()];
+      var j = i + 1;
+      while (j < lines.length && _testProgress.firstMatch(lines[j]) == null) {
+        block.add(lines[j].trimRight());
+        j++;
+      }
+      i = j;
+      while (block.length > 1 && block.last.trim().isEmpty) {
+        block.removeLast();
+      }
+      final text = block.join('\n');
+      var path = '';
+      var line = 1;
+      var col = 1;
+      var message = 'test başarısız: $title';
+      // 1) Test dosyası derlenemediyse ("loading ... [E]" + "test/a_test.dart:5:8: Error: ...").
+      for (final l in block) {
+        final c = _compile.firstMatch(l.trimLeft());
+        if (c != null) {
+          path = c.group(1)!;
+          line = int.tryParse(c.group(2)!) ?? 1;
+          col = int.tryParse(c.group(3)!) ?? 1;
+          message = 'test dosyası yüklenemedi: ${c.group(5)!.trim()}';
+          break;
+        }
+      }
+      // 2) Yığın izindeki ilk test dosyası çerçevesi.
+      if (path.isEmpty) {
+        final tf = _testStackFrame.firstMatch(text);
+        if (tf != null) {
+          path = tf.group(1)!;
+          line = int.tryParse(tf.group(2)!) ?? 1;
+          col = int.tryParse(tf.group(3)!) ?? 1;
+        }
+      }
+      // 3) Yığın izindeki ilk proje paketi çerçevesi (matcher/flutter_test vb. atlanır).
+      if (path.isEmpty) {
+        for (final f in _pkgFrameAny.allMatches(text)) {
+          if (_foreignPackages.contains(f.group(1)!)) continue;
+          path = 'lib/${f.group(2)}';
+          line = int.tryParse(f.group(3)!) ?? 1;
+          col = int.tryParse(f.group(4)!) ?? 1;
+          break;
+        }
+      }
+      // 4) Başlıktaki "test/x_test.dart: ..." / "loading test/x_test.dart".
+      if (path.isEmpty) {
+        final tf = _testFile.firstMatch(title);
+        if (tf != null) path = tf.group(1)!;
+      }
+      out.add(CiDiagnostic(
+        path: path,
+        line: line,
+        column: col,
+        severity: 'error',
+        message: message,
+        raw: text,
+      ));
+    }
+    return out;
   }
 
   /// Bir aşamanın satırlarından sorunları çıkarır.
@@ -349,6 +474,8 @@ class CiLogParser {
     if (stage == 'test') {
       final text = lines.join('\n').trim();
       if (text.isEmpty) return (diagnostics: out, infoCount: 0);
+      final failedTests = _failedTests(lines);
+      if (failedTests.isNotEmpty) return (diagnostics: failedTests, infoCount: 0);
       var path = '';
       var line = 1;
       final tf = _testFile.firstMatch(text);
@@ -458,7 +585,12 @@ class GithubHttpRequest {
     this.headers = const <String, String>{},
     this.body,
     this.timeout = const Duration(seconds: 90),
+    this.followRedirects = true,
   });
+
+  /// false: 3xx yanıtı olduğu gibi (Location başlığıyla) döner. İş günlüğü indirmede imzalı adrese
+  /// Authorization başlığı GÖNDERİLMESİN diye kullanılır (Görev 3/10).
+  final bool followRedirects;
 
   final String method;
   final Uri uri;
@@ -489,6 +621,7 @@ Future<GithubHttpResponse> githubHttpSend(GithubHttpRequest r) async {
   final client = HttpClient()..connectionTimeout = const Duration(seconds: 30);
   try {
     final req = await client.openUrl(r.method, r.uri).timeout(r.timeout);
+    req.followRedirects = r.followRedirects;
     req.headers.set(HttpHeaders.userAgentHeader, 'kripton-dev-mode');
     r.headers.forEach((k, v) => req.headers.set(k, v));
     final body = r.body;
@@ -532,7 +665,23 @@ Duration? githubRetryAfterFrom({
   return null;
 }
 
-/// GitHub Actions ile gerçek Flutter denetimi.
+/// İş akışında sabitlenen Flutter sürümü. `pubspec.yaml` `environment.sdk` alt sınırı (>=3.5.0) ile uyumlu olmalı:
+/// Flutter 3.35.x, Dart 3.9.x ile gelir. DOĞRULANAMADI: sürüm bağımlılıklarla (pub get) hiç denenmedi.
+const String kCiFlutterVersion = '3.35.7';
+
+/// [kCiFlutterVersion]'ın içerdiği Dart sürümü (test, pubspec alt sınırıyla karşılaştırır).
+const String kCiFlutterDartVersion = '3.9.2';
+
+/// Sabitlenen action sürümleri (tam sürüm etiketi). DOĞRULANAMADI: etiketlerin varlığı ve SHA karşılıkları
+/// ağ erişimi olmadığından denetlenemedi; üretimde `@<40 haneli sha>` ile değiştirilmesi önerilir.
+const String kCiActionCheckout = 'actions/checkout@v6.0.0';
+const String kCiActionSetupJava = 'actions/setup-java@v5.0.0';
+const String kCiActionFlutter = 'subosito/flutter-action@v2.18.0';
+
+/// İş akışı iş zaman aşımı (dakika).
+const int kCiJobTimeoutMinutes = 60;
+
+/// GitHub Actions ile gerçek Flutter denetimi (ESKİ YOL: yeni kod [GithubCiRunner] kullanmalı).
 class GithubCi {
   GithubCi(this.cfg);
 
@@ -544,8 +693,25 @@ class GithubCi {
   static final RegExp _scriptExt = RegExp(r'\.(sh)$');
 
   /// Actions iş akışı. İşaretçiler (`##KRIPTON-...`) günlükten aşama çıktısını ayırmak içindir.
-  static String workflowYaml({required bool runTests, required bool buildApk}) =>
+  ///
+  /// push yalnızca `kripton/**` dallarında tetiklenir; [legacyPushBranches] yalnızca eski [push] yolu içindir
+  /// (varsayılan: eski `kripton-ci` dalı). Yeni hat ([GithubCiRunner.ensureWorkflow]) bunu boş verir.
+  static String workflowYaml({
+    required bool runTests,
+    required bool buildApk,
+    String flutterVersion = kCiFlutterVersion,
+    List<String> legacyPushBranches = const <String>['kripton-ci'],
+  }) =>
       _workflowTemplate
+          .replaceAll('__PUSH_BRANCHES__', [
+            "'kripton/**'",
+            for (final b in legacyPushBranches) "'$b'",
+          ].map((e) => '      - $e').join('\n'))
+          .replaceAll('__CHECKOUT__', kCiActionCheckout)
+          .replaceAll('__JAVA__', kCiActionSetupJava)
+          .replaceAll('__FLUTTER_ACTION__', kCiActionFlutter)
+          .replaceAll('__FLUTTER_VERSION__', flutterVersion)
+          .replaceAll('__TIMEOUT__', '$kCiJobTimeoutMinutes')
           .replaceAll('__TEST__', runTests ? '1' : '0')
           .replaceAll('__BUILD__', buildApk ? '1' : '0');
 
@@ -553,9 +719,14 @@ class GithubCi {
 name: Kripton Flutter Check
 on:
   push:
+    branches:
+__PUSH_BRANCHES__
   workflow_dispatch:
 permissions:
   contents: read
+concurrency:
+  group: kripton-flutter-check-${{ github.ref }}
+  cancel-in-progress: true
 env:
   FLUTTER_SUPPRESS_ANALYTICS: 'true'
   KRIPTON_TEST: '__TEST__'
@@ -563,16 +734,17 @@ env:
 jobs:
   check:
     runs-on: ubuntu-24.04
-    timeout-minutes: 60
+    timeout-minutes: __TIMEOUT__
     steps:
-      - uses: actions/checkout@v6
-      - uses: actions/setup-java@v5
+      - uses: __CHECKOUT__
+      - uses: __JAVA__
         with:
           distribution: temurin
           java-version: '17'
-      - uses: subosito/flutter-action@v2
+      - uses: __FLUTTER_ACTION__
         with:
           channel: stable
+          flutter-version: '__FLUTTER_VERSION__'
           cache: true
       - name: Kripton kontrol
         shell: bash
@@ -726,6 +898,9 @@ jobs:
     return sha;
   }
 
+  /// KULLANMA: eski yol (force + ebeveynsiz commit). Geliştirme Modu v2 bunun yerine [DevRepoClient.commitChanges]
+  /// ve [GithubCiRunner] kullanır. Davranışı Görev 3/10'da değiştirilmedi.
+  ///
   /// [snap]'i tek (ebeveynsiz) commit olarak [GithubCiConfig.branch] dalına yazar; commit sha'sını döner.
   Future<String> push(ProjectSnapshot snap) async {
     final tree = <Map<String, Object?>>[];
@@ -815,6 +990,8 @@ jobs:
     }
   }
 
+  /// KULLANMA: eski yol ([push] kullanır). Yeni kod [GithubCiRunner.runForCommit] kullanmalı.
+  ///
   /// [snap]'i gönderir, Actions çalışmasını bekler ve sonucu döner.
   /// Ağ/hata durumunda istisna fırlatır; çağıran bekleyip yeniden dener.
   Future<CiResult> check(
@@ -896,5 +1073,789 @@ jobs:
     if (jobId == null) throw CiTransientException('Actions işi bulunamadı.');
     final log = await _text(_api('/actions/jobs/$jobId/logs'));
     return CiLogParser.parseJobLog(log, runUrl: runUrl);
+  }
+}
+
+// ================= Görev 3/10: çalıştırma ve log hattı =================
+
+/// Maskelenmiş, boyut sınırlı ham CI günlüklerini `devlogs/` benzeri bir klasöre yazar (AtomicFile, JSON).
+/// Metin diske yazılmadan ÖNCE [SecretMask.redact]'ten geçer (kırpma maskelemeden sonra yapılır).
+class CiLogStore {
+  CiLogStore({required this.dir, this.maxBytesPerLog = 2 * 1024 * 1024, this.keep = 10});
+
+  /// Günlük klasörü (uygulama belgeler klasörü altındaki `devlogs` önerilir).
+  final Directory dir;
+
+  /// Bir günlüğün en çok UTF-8 bayt sayısı; aşılırsa SONU korunur, başı kırpılır.
+  final int maxBytesPerLog;
+
+  /// Saklanan en son günlük sayısı.
+  final int keep;
+
+  static final RegExp _nameRe = RegExp(r'^ci-\d{8}T\d{6}Z-\d+\.json$');
+
+  static String _two(int n) => n.toString().padLeft(2, '0');
+
+  static String _stamp(DateTime t) =>
+      '${t.year.toString().padLeft(4, '0')}${_two(t.month)}${_two(t.day)}T${_two(t.hour)}${_two(t.minute)}${_two(t.second)}Z';
+
+  /// Günlüğü yazar ve dosya yolunu döner; hiçbir koşulda istisna fırlatmaz (başarısızsa null).
+  Future<String?> save({
+    required String branch,
+    required String sha,
+    required int runId,
+    required String runUrl,
+    required String stage,
+    required String text,
+    int? exitCode,
+    DateTime? now,
+  }) async {
+    try {
+      var body = SecretMask.redact(text);
+      final originalChars = body.length;
+      var truncated = false;
+      if (utf8.encode(body).length > maxBytesPerLog) {
+        truncated = true;
+        body = _tailByBytes(body, maxBytesPerLog);
+      }
+      final t = (now ?? DateTime.now()).toUtc();
+      final path = pth.join(dir.path, 'ci-${_stamp(t)}-$runId.json');
+      await AtomicFile.writeJson(path, <String, Object?>{
+        'v': 1,
+        'savedAt': t.toIso8601String(),
+        'branch': SecretMask.redact(branch),
+        'sha': sha,
+        'runId': runId,
+        'runUrl': SecretMask.redact(runUrl),
+        'stage': stage,
+        'exitCode': exitCode,
+        'truncated': truncated,
+        'originalChars': originalChars,
+        'log': body,
+      });
+      await prune();
+      return path;
+    } catch (e, st) {
+      CrashGuard.log('CI günlüğü yazılamadı', e, st);
+      return null;
+    }
+  }
+
+  /// Saklanan günlük dosyaları, en yenisi başta.
+  Future<List<String>> list() async {
+    try {
+      if (!await dir.exists()) return <String>[];
+      final names = <String>[];
+      await for (final e in dir.list()) {
+        if (e is! File) continue;
+        final n = pth.basename(e.path);
+        if (_nameRe.hasMatch(n)) names.add(n);
+      }
+      names.sort((a, b) => b.compareTo(a));
+      return names.map((n) => pth.join(dir.path, n)).toList();
+    } catch (_) {
+      return <String>[];
+    }
+  }
+
+  /// [keep]'ten eski günlükleri siler.
+  Future<void> prune() async {
+    final all = await list();
+    for (var i = keep; i < all.length; i++) {
+      await AtomicFile.delete(all[i]);
+    }
+  }
+
+  static String _tailByBytes(String s, int maxBytes) {
+    final bytes = utf8.encode(s);
+    if (bytes.length <= maxBytes) return s;
+    var out = utf8.decode(bytes.sublist(bytes.length - maxBytes), allowMalformed: true);
+    final nl = out.indexOf('\n');
+    if (nl >= 0 && nl < 2000) out = out.substring(nl + 1);
+    return '[… günlüğün başı bayt sınırı nedeniyle kırpıldı …]\n$out';
+  }
+}
+
+/// [GithubCiRunner.ensureWorkflow] sonucu. [committed] true ise dal ucu İLERLEDİ: çağıran sonraki
+/// `commitChanges` için [headSha]'yı `expectedHeadSha` olarak kullanmalı.
+class EnsureWorkflowResult {
+  const EnsureWorkflowResult({required this.headSha, required this.committed});
+
+  final String headSha;
+  final bool committed;
+}
+
+class _CiInfra implements Exception {
+  _CiInfra(this.reason, this.message);
+
+  final CiInfraReason reason;
+  final String message;
+}
+
+class _RunRef {
+  const _RunRef(this.id, this.url);
+
+  final int id;
+  final String url;
+}
+
+/// Çalışma dalındaki bir commit için Actions çalıştırır, bekler, günlüğü indirir, ayrıştırır ve [CiOutcome] döner.
+/// Ağ yalnızca [GithubHttpSender] üzerinden gider (testte sahte). Hiçbir sır log/ileti/diske maskesiz yazılmaz.
+class GithubCiRunner {
+  GithubCiRunner({
+    required String repo,
+    required String token,
+    DevRepoClient? repoClient,
+    GithubHttpSender? send,
+    bool Function()? cancelled,
+    Future<void>? onCancel,
+    Future<void> Function(Duration)? sleep,
+    DateTime Function()? now,
+    this.logStore,
+    this.runTests = true,
+    this.buildApk = true,
+    this.flutterVersion = kCiFlutterVersion,
+    this.findTimeout = const Duration(minutes: 6),
+    this.dispatchAfter = const Duration(seconds: 45),
+    this.queueTimeout = const Duration(minutes: 15),
+    this.overallTimeout = const Duration(minutes: 75),
+    this.pollStart = const Duration(seconds: 8),
+    this.pollMax = const Duration(seconds: 30),
+    this.logRetries = 5,
+    this.logRetryWait = const Duration(seconds: 10),
+    this.feedbackBudgetChars = CiFeedback.defaultBudgetChars,
+  })  : repo = repo.trim(),
+        _token = token.trim(),
+        _send = send ?? githubHttpSend,
+        _cancelled = cancelled ?? (() => false),
+        _onCancel = onCancel,
+        _sleep = sleep ?? ((d) => Future<void>.delayed(d)),
+        _now = now ?? DateTime.now {
+    SecretMask.register(_token);
+    _client = repoClient ??
+        DevRepoClient(
+          repo: this.repo,
+          token: _token,
+          send: _send,
+          allowWorkflowEdits: true,
+          sleep: _sleep,
+          cancelled: _cancelled,
+          onCancel: _onCancel,
+          now: _now,
+        );
+  }
+
+  factory GithubCiRunner.fromConfig(
+    GithubCiConfig cfg, {
+    GithubHttpSender? send,
+    bool Function()? cancelled,
+    Future<void>? onCancel,
+    Future<void> Function(Duration)? sleep,
+    DateTime Function()? now,
+    CiLogStore? logStore,
+  }) =>
+      GithubCiRunner(
+        repo: cfg.repo,
+        token: cfg.token,
+        send: send,
+        cancelled: cancelled,
+        onCancel: onCancel,
+        sleep: sleep,
+        now: now,
+        logStore: logStore,
+        runTests: cfg.runTests,
+        buildApk: cfg.buildApk,
+      );
+
+  /// İş akışı dosya adı (workflow_dispatch ve çalışma süzgeci için).
+  static const String workflowFile = 'kripton-flutter-check.yml';
+
+  /// Iş akışının `name:` değeri.
+  static const String workflowName = 'Kripton Flutter Check';
+
+  final String repo;
+  final String _token;
+  final GithubHttpSender _send;
+  final bool Function() _cancelled;
+  final Future<void>? _onCancel;
+  final Future<void> Function(Duration) _sleep;
+  final DateTime Function() _now;
+  late final DevRepoClient _client;
+
+  final CiLogStore? logStore;
+  final bool runTests;
+  final bool buildApk;
+  final String flutterVersion;
+
+  /// Push'un çalışma açmasını bekleme süresi (aşılırsa altyapı hatası).
+  final Duration findTimeout;
+
+  /// Bu süre sonunda çalışma yoksa workflow_dispatch ile tetiklenir.
+  final Duration dispatchAfter;
+
+  /// Çalışma kuyrukta bu kadar kalırsa (runner yok) altyapı hatası.
+  final Duration queueTimeout;
+
+  /// Çalışma başladıktan sonra toplam bekleme sınırı.
+  final Duration overallTimeout;
+  final Duration pollStart;
+  final Duration pollMax;
+  final int logRetries;
+  final Duration logRetryWait;
+  final int feedbackBudgetChars;
+
+  /// Bu dalda olması gereken iş akışı metni (yalnızca kripton/** push'u).
+  String get workflowYamlText => GithubCi.workflowYaml(
+        runTests: runTests,
+        buildApk: buildApk,
+        flutterVersion: flutterVersion,
+        legacyPushBranches: const <String>[],
+      );
+
+  // ---------------------------------------------------------------- HTTP
+
+  Uri _api(String path, [Map<String, String>? query]) => Uri.https('api.github.com', '/repos/$repo$path', query);
+
+  void _checkCancelled() {
+    if (_cancelled()) throw const CiCancelledException();
+  }
+
+  Future<void> _wait(Duration d) async {
+    _checkCancelled();
+    final oc = _onCancel;
+    await Future.any<void>(<Future<void>>[_sleep(d), if (oc != null) oc]);
+    _checkCancelled();
+  }
+
+  static Duration _backoff(int fails) {
+    final secs = 2 << (fails > 5 ? 5 : fails);
+    return Duration(seconds: secs > 60 ? 60 : secs);
+  }
+
+  String _redact(String s, {int max = 400}) {
+    final r = SecretMask.redact(s.trim());
+    return r.length > max ? r.substring(0, max) : r;
+  }
+
+  String _errMsg(GithubHttpResponse r) {
+    var text = r.body;
+    try {
+      final v = jsonDecode(r.body);
+      if (v is Map && v['message'] is String) text = v['message'] as String;
+    } catch (_) {
+      // JSON değil: ham metin
+    }
+    return _redact(text);
+  }
+
+  /// Tek istek denemesi. Ağ/5xx -> [CiTransientException]; 4xx -> [CiHttpException] ([okStatuses] hariç).
+  Future<GithubHttpResponse> _once(
+    String method,
+    Uri uri, {
+    Object? body,
+    bool auth = true,
+    bool follow = true,
+    bool checkCancel = true,
+    Map<String, String>? extra,
+    Duration timeout = const Duration(seconds: 90),
+    Set<int> okStatuses = const <int>{},
+  }) async {
+    if (checkCancel) _checkCancelled();
+    final bytes = body == null ? null : utf8.encode(jsonEncode(body));
+    final headers = <String, String>{
+      if (auth) ...<String, String>{
+        'authorization': 'Bearer $_token',
+        'accept': 'application/vnd.github+json',
+        'x-github-api-version': '2022-11-28',
+      },
+      if (bytes != null) 'content-type': 'application/json',
+      ...?extra,
+    };
+    GithubHttpResponse r;
+    try {
+      r = await _send(GithubHttpRequest(
+        method: method,
+        uri: uri,
+        headers: headers,
+        body: bytes,
+        timeout: timeout,
+        followRedirects: follow,
+      ));
+    } on TimeoutException catch (e) {
+      throw CiTransientException(_redact('GitHub bağlantı zaman aşımı: $e'));
+    } on SocketException catch (e) {
+      throw CiTransientException(_redact('GitHub bağlantı hatası: $e'));
+    } on HttpException catch (e) {
+      throw CiTransientException(_redact('GitHub bağlantı hatası: $e'));
+    } on TlsException catch (e) {
+      throw CiTransientException(_redact('GitHub TLS hatası: $e'));
+    }
+    if (r.status >= 500) throw CiTransientException('GitHub HTTP ${r.status}');
+    if (r.status >= 400 && !okStatuses.contains(r.status)) {
+      var retry = githubRetryAfterFrom(
+        status: r.status,
+        retryAfter: r.header('retry-after'),
+        remaining: r.header('x-ratelimit-remaining'),
+        reset: r.header('x-ratelimit-reset'),
+        now: _now(),
+      );
+      if (retry == null && r.status == 403 && r.body.toLowerCase().contains('rate limit')) {
+        retry = const Duration(minutes: 1);
+      }
+      throw CiHttpException(r.status, _errMsg(r), retryAfter: retry);
+    }
+    return r;
+  }
+
+  /// [op]'u geçici hatalarda (ağ, 5xx, hız sınırı) geri çekilerek [deadline]'a dek yeniden dener.
+  Future<T> _retry<T>(Future<T> Function() op, DateTime deadline) async {
+    var fails = 0;
+    while (true) {
+      _checkCancelled();
+      try {
+        return await op();
+      } on CiTransientException catch (e) {
+        fails++;
+        if (_now().isAfter(deadline)) {
+          throw _CiInfra(CiInfraReason.network, 'GitHub\'a ulaşılamadı: ${e.message}');
+        }
+        await _wait(_backoff(fails));
+      } on CiHttpException catch (e) {
+        final ra = e.retryAfter;
+        if (ra == null) rethrow;
+        if (_now().add(ra).isAfter(deadline)) {
+          throw _CiInfra(CiInfraReason.rateLimit,
+              'GitHub hız sınırı: ~${ra.inSeconds} sn beklemek gerekiyor; süre yetmiyor.');
+        }
+        await _wait(ra);
+      }
+    }
+  }
+
+  Map<String, dynamic> _asMap(String body, String what) {
+    try {
+      final v = jsonDecode(body);
+      if (v is Map<String, dynamic>) return v;
+    } catch (_) {
+      // aşağıda hata
+    }
+    throw CiTransientException('$what yanıtı beklenen biçimde değil.');
+  }
+
+  Future<Map<String, dynamic>> _getJson(String path, DateTime deadline, [Map<String, String>? query]) =>
+      _retry(() async => _asMap((await _once('GET', _api(path, query))).body, path), deadline);
+
+  static String? _str(Object? v) => v is String ? v : null;
+
+  _CiInfra _mapHttp(CiHttpException e) {
+    switch (e.status) {
+      case 401:
+        return _CiInfra(CiInfraReason.auth, 'GitHub token geçersiz ya da süresi dolmuş (401).');
+      case 403:
+        return _CiInfra(CiInfraReason.auth,
+            'GitHub bu işleme izin vermedi (403): token\'da Actions (Read/Write) ve Contents izinlerini kontrol et. ${e.message}');
+      case 404:
+        return _CiInfra(CiInfraReason.auth,
+            'GitHub kaynağı bulamadı (404): depo adı yanlış ya da token bu depoya erişemiyor. ${e.message}');
+      default:
+        return _CiInfra(CiInfraReason.other, 'GitHub HTTP ${e.status}: ${e.message}');
+    }
+  }
+
+  // ---------------------------------------------------------------- iş akışı
+
+  static String _normalizeYaml(String s) =>
+      s.replaceAll('\r\n', '\n').split('\n').map((l) => l.trimRight()).join('\n').trimRight();
+
+  /// [branch] dalında kontrol iş akışının güncel olmasını sağlar. Dosya zaten aynıysa commit ATILMAZ.
+  /// Commit atılırsa dal ucu ilerler: dönen [EnsureWorkflowResult.headSha] yeni uçtur.
+  /// Dal `kripton/` ile başlamalı ([DevRepoClient.commitChanges] zorlar); [DevConflictException] çağırana yükselir.
+  Future<EnsureWorkflowResult> ensureWorkflow(String branch) async {
+    if (!_client.allowWorkflowEdits) {
+      throw const DevPolicyException('İş akışını yazmak için DevRepoClient allowWorkflowEdits:true olmalı.');
+    }
+    try {
+      final deadline = _now().add(const Duration(minutes: 5));
+      final ref = await _retry(() async {
+        final r = await _once('GET', _api('/git/ref/heads/$branch'), okStatuses: const <int>{404});
+        if (r.status == 404) throw DevRepoException('Dal bulunamadı: "$branch".');
+        final o = _asMap(r.body, 'ref')['object'];
+        final sha = o is Map ? _str(o['sha']) : null;
+        if (sha == null) throw CiTransientException('ref yanıtında sha yok.');
+        return sha;
+      }, deadline);
+      final current = await _retry(() async {
+        final r = await _once(
+          'GET',
+          _api('/contents/${GithubCi.workflowPath}', <String, String>{'ref': branch}),
+          extra: const <String, String>{'accept': 'application/vnd.github.raw+json'},
+          okStatuses: const <int>{404},
+        );
+        return r.status == 404 ? null : r.body;
+      }, deadline);
+      final wanted = workflowYamlText;
+      if (current != null && _normalizeYaml(current) == _normalizeYaml(wanted)) {
+        return EnsureWorkflowResult(headSha: ref, committed: false);
+      }
+      final sha = await _client.commitChanges(
+        branch,
+        ref,
+        <String, String?>{GithubCi.workflowPath: wanted},
+        current == null ? 'Kripton: CI iş akışı eklendi' : 'Kripton: CI iş akışı güncellendi',
+      );
+      return EnsureWorkflowResult(headSha: sha, committed: true);
+    } on _CiInfra catch (e) {
+      throw DevRepoException(e.message);
+    } on CiHttpException catch (e) {
+      throw DevRepoException(_mapHttp(e).message);
+    }
+  }
+
+  // ---------------------------------------------------------------- çalıştırma
+
+  /// [ensureWorkflow] + [runForCommit]. Dal ucu ilerlediyse sonuçtaki `sha` yeni uçtur.
+  Future<CiOutcome> checkBranch(String branch, {void Function(String status)? status}) async {
+    try {
+      final e = await ensureWorkflow(branch);
+      return await runForCommit(branch, e.headSha, status: status);
+    } on CiCancelledException {
+      return const CiCancelled(message: 'İptal edildi.');
+    } on CiTransientException catch (e) {
+      return CiInfraError(reason: CiInfraReason.network, message: _redact(e.message));
+    } on DevConflictException {
+      rethrow; // dal ilerlemiş: çağıran dalı yeniden yüklemeli
+    } on DevPolicyException {
+      rethrow; // programlama/güvenlik kuralı hatası
+    } on DevRepoException catch (e) {
+      return CiInfraError(reason: CiInfraReason.other, message: _redact(e.message));
+    }
+  }
+
+  /// [sha] commit'i için Actions çalışmasını bulur (yoksa tetikler), bitmesini bekler ve sonucu döner.
+  /// İstisna fırlatmaz (programlama hataları hariç): her durum bir [CiOutcome]'dur.
+  /// Altyapı sorunları ASLA [CiFailure] olmaz.
+  Future<CiOutcome> runForCommit(String branch, String sha, {void Function(String status)? status}) async {
+    void say(String s) => status?.call(s);
+    final started = _now();
+    final deadline = started.add(overallTimeout);
+    int? runId;
+    var runUrl = '';
+    try {
+      final ref = await _findRun(branch, sha, started, deadline, say);
+      runId = ref.id;
+      runUrl = ref.url;
+      return await _awaitAndCollect(branch, sha, ref, deadline, say);
+    } on CiCancelledException {
+      if (runId != null) await _cancelRun(runId);
+      return CiCancelled(message: 'İptal edildi.', runUrl: runUrl, sha: sha, runId: runId);
+    } on _CiInfra catch (e) {
+      if (runId != null && (e.reason == CiInfraReason.timeout || e.reason == CiInfraReason.runnerNotStarted)) {
+        await _cancelRun(runId);
+      }
+      return CiInfraError(reason: e.reason, message: _redact(e.message, max: 1500), runUrl: runUrl, sha: sha, runId: runId);
+    } on CiHttpException catch (e) {
+      final m = _mapHttp(e);
+      return CiInfraError(reason: m.reason, message: _redact(m.message, max: 1500), runUrl: runUrl, sha: sha, runId: runId);
+    } on CiTransientException catch (e) {
+      return CiInfraError(
+          reason: CiInfraReason.network, message: _redact(e.message), runUrl: runUrl, sha: sha, runId: runId);
+    }
+  }
+
+  Future<void> _cancelRun(int runId) async {
+    try {
+      await _once(
+        'POST',
+        _api('/actions/runs/$runId/cancel'),
+        checkCancel: false,
+        okStatuses: const <int>{409, 404, 403},
+      );
+    } catch (_) {
+      // en iyi çaba
+    }
+  }
+
+  _RunRef? _pickRun(Map<String, dynamic> json, String sha) {
+    final runs = json['workflow_runs'];
+    if (runs is! List) return null;
+    _RunRef? best;
+    for (final r in runs) {
+      if (r is! Map) continue;
+      if (r['head_sha'] != sha) continue;
+      final path = _str(r['path']) ?? '';
+      final name = _str(r['name']) ?? '';
+      if (!path.contains(workflowFile) && name != workflowName) continue;
+      final id = r['id'];
+      if (id is! num) continue;
+      if (best == null || id.toInt() > best.id) best = _RunRef(id.toInt(), _str(r['html_url']) ?? '');
+    }
+    return best;
+  }
+
+  Future<_RunRef> _findRun(
+    String branch,
+    String sha,
+    DateTime started,
+    DateTime deadline,
+    void Function(String) say,
+  ) async {
+    var dispatched = false;
+    String dispatchNote = '';
+    while (true) {
+      final j = await _getJson('/actions/runs', deadline, <String, String>{'head_sha': sha, 'per_page': '20'});
+      final ref = _pickRun(j, sha);
+      if (ref != null) return ref;
+      final el = _now().difference(started);
+      if (!dispatched && el >= dispatchAfter) {
+        dispatched = true;
+        say('GitHub: push çalışma açmadı; workflow_dispatch deneniyor…');
+        dispatchNote = await _dispatch(branch, deadline);
+      }
+      if (el >= findTimeout) throw await _notStarted(dispatchNote);
+      say('GitHub: Actions çalışması bekleniyor…');
+      await _wait(pollStart);
+    }
+  }
+
+  /// workflow_dispatch tetikler. 404/422 (iş akışı varsayılan dalda yok vb.) hata sayılmaz; açıklama döner.
+  Future<String> _dispatch(String branch, DateTime deadline) async {
+    final r = await _retry(
+      () => _once(
+        'POST',
+        _api('/actions/workflows/$workflowFile/dispatches'),
+        body: <String, Object?>{'ref': branch},
+        okStatuses: const <int>{404, 422},
+      ),
+      deadline,
+    );
+    if (r.status == 404 || r.status == 422) {
+      return 'workflow_dispatch reddedildi (HTTP ${r.status}: ${_errMsg(r)}). İş akışı varsayılan dalda yoksa '
+          'dispatch çalışmaz; push tetiklemesi de çalışmadıysa depoda Actions kapalı olabilir.';
+    }
+    return '';
+  }
+
+  Future<_CiInfra> _notStarted(String dispatchNote) async {
+    try {
+      final r = await _once('GET', _api('/actions/permissions'), okStatuses: const <int>{403, 404});
+      if (r.status == 200) {
+        final j = _asMap(r.body, 'permissions');
+        if (j['enabled'] == false) {
+          return _CiInfra(CiInfraReason.actionsDisabled,
+              'Bu depoda GitHub Actions kapalı. Depo Ayarları > Actions bölümünden açılmalı.');
+        }
+      }
+    } on CiCancelledException {
+      rethrow;
+    } catch (_) {
+      // sınıflandırma en iyi çaba
+    }
+    return _CiInfra(
+      dispatchNote.isNotEmpty ? CiInfraReason.workflowMissing : CiInfraReason.runnerNotStarted,
+      'Actions çalışması başlamadı (${findTimeout.inMinutes} dk). Token\'da "workflow"/Actions yetkisi var mı? '
+      '$dispatchNote'.trim(),
+    );
+  }
+
+  Future<CiOutcome> _awaitAndCollect(
+    String branch,
+    String sha,
+    _RunRef ref,
+    DateTime deadline,
+    void Function(String) say,
+  ) async {
+    final runStarted = _now();
+    var poll = pollStart;
+    DateTime? queuedSince;
+    String? conclusion;
+    while (true) {
+      if (_now().isAfter(deadline)) {
+        throw _CiInfra(CiInfraReason.timeout, 'Actions çalışması ${overallTimeout.inMinutes} dakikada bitmedi.');
+      }
+      final j = await _getJson('/actions/runs/${ref.id}', deadline);
+      final st = _str(j['status']);
+      if (st == 'completed') {
+        conclusion = _str(j['conclusion']);
+        break;
+      }
+      if (st == 'queued' || st == 'waiting' || st == 'pending' || st == 'requested') {
+        queuedSince ??= _now();
+        if (_now().difference(queuedSince) > queueTimeout) {
+          throw _CiInfra(CiInfraReason.runnerNotStarted,
+              'Çalışma ${queueTimeout.inMinutes} dakikadır kuyrukta; runner atanmadı.');
+        }
+      } else {
+        queuedSince = null;
+      }
+      final el = _now().difference(runStarted);
+      say('GitHub: Actions çalışıyor (${el.inMinutes} dk ${el.inSeconds % 60} sn)…');
+      await _wait(poll);
+      final next = poll + const Duration(seconds: 4);
+      poll = next > pollMax ? pollMax : next;
+    }
+
+    CiOutcome ok() => CiSuccess(runUrl: ref.url, sha: sha, runId: ref.id);
+    switch (conclusion) {
+      case 'success':
+      case 'neutral':
+        return ok();
+      case 'timed_out':
+        throw _CiInfra(CiInfraReason.timeout, 'Actions işi zaman aşımına uğradı (timeout-minutes).');
+      case 'startup_failure':
+        throw _CiInfra(CiInfraReason.startupFailure,
+            'Actions çalışması başlatılamadı (startup_failure): iş akışı geçersiz olabilir ya da hesap/faturalandırma sorunu var.');
+      case 'cancelled':
+        {
+          if (await _anyJobTimedOut(ref.id, deadline)) {
+            throw _CiInfra(CiInfraReason.timeout, 'Actions işi zaman aşımına uğradı (timeout-minutes).');
+          }
+          return CiCancelled(
+            message: 'Actions çalışması iptal edildi (aynı dala yeni commit/elle iptal olabilir).',
+            runUrl: ref.url,
+            sha: sha,
+            runId: ref.id,
+          );
+        }
+      case 'skipped':
+      case 'stale':
+        return CiCancelled(message: 'Actions çalışması atlandı ($conclusion).', runUrl: ref.url, sha: sha, runId: ref.id);
+      case 'failure':
+        say('GitHub: hata günlüğü indiriliyor…');
+        return _collectFailure(branch, sha, ref, deadline);
+      default:
+        throw _CiInfra(CiInfraReason.other, 'Actions çalışması beklenmeyen sonuçla bitti: ${conclusion ?? 'bilinmiyor'}.');
+    }
+  }
+
+  Future<List<Map<String, dynamic>>> _jobs(int runId, DateTime deadline) async {
+    final j = await _getJson('/actions/runs/$runId/jobs', deadline, <String, String>{'per_page': '30', 'filter': 'latest'});
+    final jobs = j['jobs'];
+    return <Map<String, dynamic>>[
+      if (jobs is List)
+        for (final e in jobs)
+          if (e is Map<String, dynamic>) e,
+    ];
+  }
+
+  Future<bool> _anyJobTimedOut(int runId, DateTime deadline) async {
+    final jobs = await _jobs(runId, deadline);
+    for (final job in jobs) {
+      if (job['conclusion'] == 'timed_out') return true;
+      final steps = job['steps'];
+      if (steps is List && steps.any((s) => s is Map && s['conclusion'] == 'timed_out')) return true;
+    }
+    return false;
+  }
+
+  Future<CiOutcome> _collectFailure(String branch, String sha, _RunRef ref, DateTime deadline) async {
+    final jobs = await _jobs(ref.id, deadline);
+    if (jobs.isEmpty) throw _CiInfra(CiInfraReason.other, 'Actions işi bulunamadı.');
+    Map<String, dynamic> job = jobs.first;
+    for (final j in jobs) {
+      final c = j['conclusion'];
+      if (c != 'success' && c != 'skipped') {
+        job = j;
+        break;
+      }
+    }
+    if (job['conclusion'] == 'timed_out') {
+      throw _CiInfra(CiInfraReason.timeout, 'Actions işi zaman aşımına uğradı (timeout-minutes).');
+    }
+    String? failedStep;
+    final steps = job['steps'];
+    if (steps is List) {
+      for (final s in steps) {
+        if (s is Map && s['conclusion'] == 'failure') {
+          failedStep = _str(s['name']);
+          break;
+        }
+      }
+    }
+    final jobId = job['id'];
+    if (jobId is! num) throw _CiInfra(CiInfraReason.other, 'Actions iş kimliği okunamadı.');
+    // Sırlar indirilir indirilmez maskelenir: ayrıştırma, AI metni ve diske yazım maskeli metinden yapılır.
+    final log = SecretMask.redact(await _downloadLog(jobId.toInt(), deadline));
+    final res = CiLogParser.parseJobLog(log, runUrl: ref.url);
+    final raw = res.stageLog.isEmpty ? log : res.stageLog;
+
+    Future<String?> store() async => logStore?.save(
+          branch: branch,
+          sha: sha,
+          runId: ref.id,
+          runUrl: ref.url,
+          stage: res.stage,
+          exitCode: res.exitCode,
+          text: raw,
+        );
+
+    CiInfraError infra(CiInfraReason reason, String message, String? path) => CiInfraError(
+          reason: reason,
+          message: _redact('$message\n${_tail(log, 20)}', max: 2500),
+          rawLogPath: path,
+          runUrl: ref.url,
+          sha: sha,
+          runId: ref.id,
+        );
+
+    if (failedStep != null && failedStep != 'Kripton kontrol') {
+      return infra(CiInfraReason.setupFailed, 'Kurulum adımı başarısız: "$failedStep" (kod hatası değil).', await store());
+    }
+    if (res.ok) {
+      return infra(CiInfraReason.setupFailed,
+          'Tüm Kripton aşamaları 0 ile bitti ama iş başarısız (kurulum/sonlandırma adımı).', await store());
+    }
+    if (res.stage == 'setup') {
+      return infra(CiInfraReason.setupFailed, 'Kripton aşamaları hiç başlamadı (checkout/Flutter kurulumu).', await store());
+    }
+    if (res.incomplete) {
+      return infra(CiInfraReason.stageInterrupted,
+          '"${res.stage}" aşaması bitiş işaretçisi olmadan kesildi (runner kaybı/zaman aşımı).', await store());
+    }
+    return CiFailure(
+      signature: CiFailureSignature.of(res),
+      feedback: CiFeedback.forAi(res, budgetChars: feedbackBudgetChars),
+      result: res,
+      rawLogPath: await store(),
+      runUrl: ref.url,
+      sha: sha,
+      runId: ref.id,
+    );
+  }
+
+  static String _tail(String log, int n) {
+    final lines = log.split('\n').map(CiLogParser.cleanLine).where((l) => l.trim().isNotEmpty).toList();
+    final from = lines.length > n ? lines.length - n : 0;
+    return lines.sublist(from).join('\n');
+  }
+
+  /// İş günlüğünü indirir. İmzalı adrese yönlenmede Authorization başlığı GÖNDERİLMEZ.
+  Future<String> _downloadLog(int jobId, DateTime deadline) async {
+    var tries = 0;
+    var lastStatus = 0;
+    while (true) {
+      final r = await _retry(
+        () => _once('GET', _api('/actions/jobs/$jobId/logs'), follow: false, okStatuses: const <int>{404, 410}),
+        deadline,
+      );
+      lastStatus = r.status;
+      if (r.status >= 300 && r.status < 400) {
+        final uri = Uri.tryParse(r.header('location') ?? '');
+        if (uri != null && uri.scheme == 'https') {
+          final r2 = await _retry(
+            () => _once('GET', uri, auth: false, timeout: const Duration(minutes: 3), okStatuses: const <int>{403, 404, 410}),
+            deadline,
+          );
+          lastStatus = r2.status;
+          if (r2.status >= 200 && r2.status < 300) return r2.body;
+        }
+      } else if (r.status >= 200 && r.status < 300) {
+        return r.body;
+      }
+      tries++;
+      if (tries > logRetries) {
+        throw _CiInfra(CiInfraReason.logsUnavailable, 'İş günlüğü indirilemedi (HTTP $lastStatus).');
+      }
+      await _wait(logRetryWait);
+    }
   }
 }

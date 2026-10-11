@@ -114,3 +114,62 @@ Future<GithubHttpResponse> githubHttpSend(GithubHttpRequest r); Duration? github
 - Yeniden deneme jitter'sizdir (deterministik: 0,5/1/2 sn). POST pulls/merge ağ hatasında yeniden denenmez (çift işlem riski).
 - Commit içeriğinde yalnızca KAYITLI sırlar aranır (kalıp tabanlı arama kodda yanlış pozitif üretirdi).
 - Kapsam dışı: `GithubCi.push` hâlâ force + ebeveynsiz commit kullanıyor (istendiği gibi dokunulmadı); sonraki görevde dev modu bu yoldan çıkarılmalı.
+
+
+## GÖREV 3/10: GitHub Actions çalıştırma ve log hattı
+
+### Yapılanlar
+- `lib/data/github_ci.dart`:
+  - `workflowYaml` yenilendi: `on: push` yalnızca `kripton/**` (+ `workflow_dispatch`), `permissions: contents: read`, `concurrency` (dal başına, eskiyi iptal), `timeout-minutes: 60`, Flutter `3.35.7` sabit, action'lar tam sürüm etiketiyle sabit. `legacyPushBranches` (varsayılan `['kripton-ci']`) yalnızca ESKİ `GithubCi.push` yolunun bozulmaması içindir; yeni hat `[]` verir. Betik gövdesi (cleanup/pub-get/analyze/test/build işaretçileri) değişmedi.
+  - `GithubHttpRequest.followRedirects` (varsayılan true) eklendi, `githubHttpSend` bunu uygular (günlük indirmede imzalı adrese Authorization gitmesin diye).
+  - `CiResult`: `exitCode`, `incomplete` eklendi (geriye uyumlu). `CiLogParser`: test aşaması artık başarısız testleri tek tek ayrıştırır (`[E]` blokları, yığın izinden `test/` ya da proje `lib/` konumu, yüklenemeyen test dosyası); `infoLines` eklendi.
+  - `GithubCiRunner` (YENİ): `ensureWorkflow`, `runForCommit`, `checkBranch`. `CiLogStore` (YENİ): maskeli, boyut sınırlı, AtomicFile ile JSON günlük.
+  - `GithubCi.push` ve `GithubCi.check` "KULLANMA" diye işaretlendi (davranışa dokunulmadı; `app_controller` hâlâ çağırıyor).
+- `lib/data/ci_feedback.dart` (YENİ): `CiOutcome` (sealed: `CiSuccess`, `CiFailure`, `CiInfraError`, `CiCancelled`), `CiInfraReason`, `CiFailureSignature`, `CiFeedback`, `CiFeedbackReport`.
+- Testler: `test/github_ci_test.dart` (genişletildi), `test/ci_feedback_test.dart` (YENİ), `test/fixtures/ci/*.log` (YENİ, 8 dosya). `lib/application/ci_batch.dart` değişmedi.
+
+### Public API (sonraki agent için)
+```dart
+// lib/data/ci_feedback.dart
+enum CiInfraReason { actionsDisabled, workflowMissing, runnerNotStarted, timeout, auth, rateLimit, network,
+  setupFailed, stageInterrupted, startupFailure, logsUnavailable, other }
+sealed class CiOutcome { String runUrl, sha; int? runId; }
+final class CiSuccess extends CiOutcome { CiResult? result; }
+final class CiFailure extends CiOutcome { CiFailureSignature signature; String feedback; CiResult result; String? rawLogPath; }
+final class CiInfraError extends CiOutcome { CiInfraReason reason; String message; String? rawLogPath; }   // ASLA AI'ya "düzelt" diye verilmez
+final class CiCancelled extends CiOutcome { String message; }
+class CiFailureSignature { String stage; List<String> entries; String key; String get id; bool sameAs(o); static CiFailureSignature.of(CiResult) }
+class CiFeedback { static const defaultBudgetChars = 12000; static String forAi(CiResult, {int budgetChars}); static CiFeedbackReport build(CiResult, {int budgetChars}); }
+class CiFeedbackReport { String text; int droppedInfoLines, droppedWarningGroups, droppedRepeats, droppedContextLines; bool overBudget; }
+// lib/data/github_ci.dart
+const kCiFlutterVersion = '3.35.7'; const kCiFlutterDartVersion = '3.9.2'; const kCiActionCheckout/SetupJava/Flutter; const kCiJobTimeoutMinutes = 60;
+GithubCi.workflowYaml({required bool runTests, required bool buildApk, String flutterVersion, List<String> legacyPushBranches});
+class CiLogStore { CiLogStore({required Directory dir, int maxBytesPerLog = 2 MB, int keep = 10});
+  Future<String?> save({branch, sha, runId, runUrl, stage, text, exitCode, now}); Future<List<String>> list(); Future<void> prune(); }
+class EnsureWorkflowResult { String headSha; bool committed; }
+class GithubCiRunner {
+  GithubCiRunner({required repo, required token, DevRepoClient? repoClient /*allowWorkflowEdits:true olmalı*/, GithubHttpSender? send,
+    bool Function()? cancelled, Future<void>? onCancel, sleep, now, CiLogStore? logStore, runTests, buildApk, flutterVersion,
+    findTimeout=6dk, dispatchAfter=45sn, queueTimeout=15dk, overallTimeout=75dk, pollStart=8sn, pollMax=30sn, logRetries=5, logRetryWait=10sn, feedbackBudgetChars});
+  factory GithubCiRunner.fromConfig(GithubCiConfig cfg, {send, cancelled, onCancel, sleep, now, logStore});
+  Future<EnsureWorkflowResult> ensureWorkflow(String branch);              // aynıysa commit atmaz; committed:true ise dal ucu İLERLER
+  Future<CiOutcome> runForCommit(String branch, String sha, {void Function(String)? status});   // istisna fırlatmaz
+  Future<CiOutcome> checkBranch(String branch, {status});                  // ensure + run; DevConflictException/DevPolicyException yükselir
+}
+```
+- Kullanım: `checkBranch` workflow commit'i atarsa `outcome.sha` yeni uçtur; orkestratör sonraki `commitChanges` için bunu `expectedHeadSha` yapmalı. `CiFailure.feedback` AI'ya gider; `signature.sameAs(önceki)` "aynı hata tekrarlandı" döngü tespitidir. `CiInfraError` için kod düzeltmesi yapılmaz: kullanıcıya bildir/bekle/yeniden dene.
+- `CiLogStore` dizini çağıranın seçimidir (öneri: `<belgeler>/devlogs`); `Storage` dizin yolunu dışarı vermediği için `forStorage` yazılmadı.
+
+### DOĞRULANAMADI
+- `dart format`, `flutter analyze`, `flutter test` ÇALIŞTIRILAMADI (ortamda Dart/Flutter SDK yok, indirme engelli). Yazılan kod ve testler DERLENMEDİ/ÇALIŞTIRILMADI; yalnızca elle gözden geçirildi. Üretilen YAML Python ile ayrıştırıldı (geçerli); fixture regex'leri Python'da denendi.
+- Flutter `3.35.7` / Dart `3.9.2` eşlemesi ve bu sürümle `pub get`'in çözülmesi; action etiketlerinin (`checkout@v6.0.0`, `setup-java@v5.0.0`, `flutter-action@v2.18.0`) varlığı ve SHA karşılıkları (ağ yok). Üretimde SHA ile sabitlenmeli; yanlış etiket her çalışmayı `setupFailed` yapar.
+- GitHub davranışları: push ile açılan çalışmanın `path`/`name` alanları; `workflow_dispatch`'in varsayılan dalda dosya gerektirmesi (gerektiriyorsa tek tetik push'tur); iş zaman aşımında run/job `conclusion` değeri (`timed_out` mı `cancelled` mı); `filter=latest` parametresi; `/actions/jobs/{id}/logs` 302 + imzalı adres; `Accept: application/vnd.github.raw+json` ile contents; gerçek `flutter test` `[E]` çıktı biçimi sürümler arası.
+
+### Bilinen riskler
+- Eski yol (`GithubCi.push/check`) yeni YAML ile `kripton-ci` dalında çalışmaya devam eder (özellikle `legacyPushBranches` varsayılanı sayesinde); dev modu bu yoldan çıkarılınca varsayılan `[]` yapılmalı. Eski yol artık `concurrency` ile aynı daldaki eski çalışmayı iptal eder.
+- `github_ci.dart` ↔ `ci_feedback.dart` ↔ `github_repo.dart` döngüsel import (Dart'ta geçerli, yalnızca tip bağımlılığı).
+- Günlük, indirilir indirilmez `SecretMask.redact`'ten geçer; `Bearer ...`/`api_key=...` kalıpları günlükte yanlış pozitif maskeleme üretebilir.
+- Aynı SHA için önceki bir çalışma (ör. iptal edilmiş) bulunursa en yeni çalışma kullanılır; `cancelled` sonucu dönerse çağıran yeniden deneyebilir.
+- `CiFeedback`: hata satırları bütçeyi aşsa bile kırpılmaz (`overBudget`); model bağlamı çağıran tarafından ayrıca denetlenmeli. Ayrıştırılamayan aşamada hata benzeri satırlar (error/failed/hata...) hiç atılmaz.
+- Test aşaması: `[E]` bloğu bulunamazsa eski toplu davranış (tek tanı) kalır; hiçbir tanı çıkmazsa `CiFeedback` aşama çıktısını ham verir.
+- `ci_batch.dart` (`CiBatcher`) başarısız test/derleme tanılarını artık tek tek alır; proje dışı yol (`test/...` yoksa) `unmatched` olur.

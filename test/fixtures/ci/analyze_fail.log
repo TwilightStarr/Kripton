@@ -1,0 +1,23 @@
+2026-10-11T10:00:01.0001000Z ##[group]Run Kripton kontrol
+2026-10-11T10:00:02.0002000Z shell: /usr/bin/bash -e {0}
+2026-10-11T10:00:03.0003000Z ##[endgroup]
+2026-10-11T10:00:04.0004000Z ##KRIPTON-BEGIN:cleanup
+2026-10-11T10:00:05.0005000Z [Kripton] test/widget_test.dart yok; temizlenecek varsayılan test bulunmadı.
+2026-10-11T10:00:06.0006000Z 
+2026-10-11T10:00:07.0007000Z ##KRIPTON-END:cleanup:0
+2026-10-11T10:00:08.0008000Z ##KRIPTON-BEGIN:pub-get
+2026-10-11T10:00:09.0009000Z Resolving dependencies...
+2026-10-11T10:00:10.0010000Z Got dependencies!
+2026-10-11T10:00:11.0011000Z 
+2026-10-11T10:00:12.0012000Z ##KRIPTON-END:pub-get:0
+2026-10-11T10:00:13.0013000Z ##KRIPTON-BEGIN:analyze
+2026-10-11T10:00:14.0014000Z Analyzing kripton_ai...
+2026-10-11T10:00:15.0015000Z    info • Use 'const' with the constructor to improve performance • lib/ui/a.dart:10:5 • prefer_const_constructors
+2026-10-11T10:00:16.0016000Z   error • The method 'foo' isn't defined for the type 'Bar' • lib/data/x.dart:12:5 • undefined_method
+2026-10-11T10:00:17.0017000Z   error • Undefined name 'q' • lib/data/x.dart:40:3 • undefined_identifier
+2026-10-11T10:00:18.0018000Z   error • Undefined name 'q' • lib/data/x.dart:55:9 • undefined_identifier
+2026-10-11T10:00:19.0019000Z warning • Unused import: 'dart:io' • lib/data/y.dart:1:8 • unused_import
+2026-10-11T10:00:20.0020000Z 
+2026-10-11T10:00:21.0021000Z 5 issues found. (ran in 3.1s)
+2026-10-11T10:00:22.0022000Z 
+2026-10-11T10:00:23.0023000Z ##KRIPTON-END:analyze:1

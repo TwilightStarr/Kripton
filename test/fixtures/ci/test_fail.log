@@ -1,0 +1,36 @@
+2026-10-11T10:00:01.0001000Z ##[group]Run Kripton kontrol
+2026-10-11T10:00:02.0002000Z shell: /usr/bin/bash -e {0}
+2026-10-11T10:00:03.0003000Z ##[endgroup]
+2026-10-11T10:00:04.0004000Z ##KRIPTON-BEGIN:cleanup
+2026-10-11T10:00:05.0005000Z [Kripton] test/widget_test.dart yok; temizlenecek varsayılan test bulunmadı.
+2026-10-11T10:00:06.0006000Z 
+2026-10-11T10:00:07.0007000Z ##KRIPTON-END:cleanup:0
+2026-10-11T10:00:08.0008000Z ##KRIPTON-BEGIN:pub-get
+2026-10-11T10:00:09.0009000Z Resolving dependencies...
+2026-10-11T10:00:10.0010000Z Got dependencies!
+2026-10-11T10:00:11.0011000Z 
+2026-10-11T10:00:12.0012000Z ##KRIPTON-END:pub-get:0
+2026-10-11T10:00:24.0024000Z ##KRIPTON-BEGIN:analyze
+2026-10-11T10:00:25.0025000Z No issues found! (ran in 2.9s)
+2026-10-11T10:00:26.0026000Z 
+2026-10-11T10:00:27.0027000Z ##KRIPTON-END:analyze:0
+2026-10-11T10:00:28.0028000Z ##KRIPTON-BEGIN:test
+2026-10-11T10:00:29.0029000Z 00:01 +0: loading test/a_test.dart
+2026-10-11T10:00:30.0030000Z 00:02 +3: test/a_test.dart: toplama doğru çalışır
+2026-10-11T10:00:31.0031000Z 00:02 +3 -1: test/a_test.dart: çıkarma hatalı [E]
+2026-10-11T10:00:32.0032000Z   Expected: <3>
+2026-10-11T10:00:33.0033000Z     Actual: <2>
+2026-10-11T10:00:34.0034000Z   
+2026-10-11T10:00:35.0035000Z   package:matcher                                     expect
+2026-10-11T10:00:36.0036000Z   package:flutter_test/src/widget_tester.dart 489:10  expect
+2026-10-11T10:00:37.0037000Z   test/a_test.dart 12:5                               main.<fn>.<fn>
+2026-10-11T10:00:38.0038000Z   
+2026-10-11T10:00:39.0039000Z   To run this test again: /opt/flutter/bin/cache/dart-sdk/bin/dart test test/a_test.dart -p vm --plain-name 'çıkarma hatalı'
+2026-10-11T10:00:40.0040000Z 00:03 +3 -1: test/b_test.dart: motor başlatılır [E]
+2026-10-11T10:00:41.0041000Z   Bad state: engine not ready
+2026-10-11T10:00:42.0042000Z   package:kripton_ai/data/llm_engine.dart 77:9        LlmEngine.start
+2026-10-11T10:00:43.0043000Z   test/b_test.dart 20:11                              main.<fn>
+2026-10-11T10:00:44.0044000Z   
+2026-10-11T10:00:45.0045000Z 00:04 +3 -2: Some tests failed.
+2026-10-11T10:00:46.0046000Z 
+2026-10-11T10:00:47.0047000Z ##KRIPTON-END:test:1
