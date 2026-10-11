@@ -6,6 +6,7 @@ import 'package:archive/archive.dart';
 import 'package:flutter/foundation.dart';
 
 import '../domain/workflow_package_schema.dart';
+import 'secret_mask.dart';
 
 class ZipValidationException implements Exception {
   final String message;
@@ -199,15 +200,19 @@ class WorkflowZipService {
   }
 
   /// Akışı standart ZIP paketi olarak dışa aktarır.
+  /// Dışa aktarılan her metin [SecretMask.redact] ile maskelenir. Statik durum isolate'lar arası
+  /// paylaşılmadığından kayıtlı sırlar isolate'a ayrıca taşınır.
   static Future<Uint8List> exportWorkflowToZip(ResolvedWorkflowPackage pkg) =>
-      compute(_createZipBytesInIsolate, pkg);
+      compute(_createZipBytesInIsolate, (pkg: pkg, known: SecretMask.exportKnown()));
 
   static void _add(Archive a, String name, String text) {
-    final b = utf8.encode(text);
+    final b = utf8.encode(SecretMask.redact(text));
     a.addFile(ArchiveFile(name, b.length, b));
   }
 
-  static Uint8List _createZipBytesInIsolate(ResolvedWorkflowPackage pkg) {
+  static Uint8List _createZipBytesInIsolate(({ResolvedWorkflowPackage pkg, List<String> known}) job) {
+    SecretMask.registerAll(job.known);
+    final pkg = job.pkg;
     final archive = Archive();
     final newSteps = <WorkflowStepManifest>[];
 

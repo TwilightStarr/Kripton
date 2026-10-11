@@ -10,6 +10,7 @@ import 'chatml_parser.dart';
 import 'crash_guard.dart';
 import 'llm_engine.dart';
 import 'secret_mask.dart';
+import 'secret_store.dart';
 import 'storage.dart';
 
 /// Bulut modellerinin sahte "dosya yolu" öneki (örn. `cloud:auto`).
@@ -102,10 +103,12 @@ class CloudProviderConfig {
   @override
   String toString() => 'CloudProviderConfig(model: $model, enabled: $enabled, key: ${SecretMask.placeholder})';
 
-  Map<String, dynamic> toJson() => {'key': apiKey, 'model': model, 'enabled': enabled};
+  /// Yalnızca sır OLMAYAN alanlar: API anahtarı JSON'a yazılmaz (güvenli depoda tutulur).
+  Map<String, dynamic> toJson() => {'model': model, 'enabled': enabled};
 }
 
-/// Kalıcı bulut ayarları (API anahtarları uygulamanın özel klasöründe `cloud_config.json` içinde durur).
+/// Kalıcı bulut ayarları. Sır olmayan alanlar `cloud_config.json` içinde, API anahtarları güvenli depoda
+/// ([SecretVault], anahtar adları `cloud.gemini` / `cloud.groq` / `cloud.openrouter`) durur.
 class CloudConfig {
   CloudConfig._();
 
@@ -131,61 +134,170 @@ class CloudConfig {
 
   bool get anyUsable => providers.values.any((c) => c.usable);
 
-  Future<void> load([Storage? storage]) async {
-    try {
-      final raw = await (storage ?? Storage()).loadJson(fileName);
-      if (raw is! Map) return;
-      final prov = raw['providers'];
-      if (prov is Map) {
-        for (final p in CloudProvider.values) {
-          final m = prov[p.name];
-          if (m is! Map) continue;
-          final c = providers[p]!;
-          final key = m['key'];
-          c.apiKey = key is String ? key.trim() : '';
-          SecretMask.register(c.apiKey);
-          final modelRaw = m['model'];
-          final model = normalizeModelName(modelRaw is String ? modelRaw : '');
-          c.model = model.isEmpty ? p.defaultModel : model;
-          c.enabled = m['enabled'] != false;
-        }
-      }
-      final ord = raw['order'];
-      if (ord is List) {
-        final parsed = <CloudProvider>[];
-        for (final e in ord) {
-          final p = e is String ? _providerById(e) : null;
-          if (p != null && !parsed.contains(p)) parsed.add(p);
-        }
-        for (final p in CloudProvider.values) {
-          if (!parsed.contains(p)) parsed.add(p);
-        }
-        order = parsed;
-      }
-      research = raw['research'] != false;
-      hybrid = raw['hybrid'] != false;
-    } catch (e, st) {
-      // Beklenmeyen biçim: varsayılanlarla devam; uygulama açılışta çökmez.
-      CrashGuard.log('Bulut ayarları okunamadı', e, st);
-    }
-  }
+  /// Güvenli depo kullanılamadığında doldurulur (arayüz gösterebilir); sorun yoksa null.
+  SecretStoreUnavailable? secretStatus;
 
-  Future<void> save([Storage? storage]) async {
-    for (final c in providers.values) {
+  /// Henüz güvenli depoya taşınamamış, eski JSON'da duran düz metin anahtarlar.
+  final Map<CloudProvider, String> _legacyPlain = <CloudProvider, String>{};
+
+  /// Taşınamayan eski düz metin diskte kaldıysa: sonraki başarılı kayıtta `.bak`/`.corrupt` kopyaları silinir.
+  bool _needsPurge = false;
+
+  /// Ayarları yükler. Eski JSON'da düz metin anahtar varsa güvenli depoya taşır: yaz → geri oku → aynı mı
+  /// doğrula → ancak o zaman JSON'u sırsız yeniden yaz. Doğrulama başarısızsa eski JSON'a dokunulmaz ve
+  /// anahtar yalnızca oturum belleğinde tutulur. Güvenli depo kullanılamıyorsa [SecretStoreUnavailable] döner.
+  Future<SecretStoreUnavailable?> load([Storage? storage, SecretVault? vault]) async {
+    final st = storage ?? Storage();
+    final v = vault ?? SecretVault.instance;
+    final legacy = <CloudProvider, String>{};
+    try {
+      final raw = await st.loadJson(fileName);
+      if (raw is Map) {
+        final prov = raw['providers'];
+        if (prov is Map) {
+          for (final p in CloudProvider.values) {
+            final m = prov[p.name];
+            if (m is! Map) continue;
+            final c = providers[p]!;
+            final key = m['key'];
+            if (key is String && key.trim().isNotEmpty) {
+              legacy[p] = key.trim();
+              SecretMask.register(key.trim());
+            }
+            final modelRaw = m['model'];
+            final model = normalizeModelName(modelRaw is String ? modelRaw : '');
+            c.model = model.isEmpty ? p.defaultModel : model;
+            c.enabled = m['enabled'] != false;
+          }
+        }
+        final ord = raw['order'];
+        if (ord is List) {
+          final parsed = <CloudProvider>[];
+          for (final e in ord) {
+            final p = e is String ? _providerById(e) : null;
+            if (p != null && !parsed.contains(p)) parsed.add(p);
+          }
+          for (final p in CloudProvider.values) {
+            if (!parsed.contains(p)) parsed.add(p);
+          }
+          order = parsed;
+        }
+        research = raw['research'] != false;
+        hybrid = raw['hybrid'] != false;
+      }
+    } catch (e, st2) {
+      // Beklenmeyen biçim: varsayılanlarla devam; uygulama açılışta çökmez.
+      CrashGuard.log('Bulut ayarları okunamadı', e, st2);
+    }
+
+    // Sırlar: güvenli depodan (JSON bozuk/eksik olsa bile) okunur; eski düz metin varsa taşınır.
+    final failed = <String>[];
+    var pendingPlain = false;
+    _legacyPlain.clear();
+    for (final p in CloudProvider.values) {
+      final c = providers[p]!;
+      final key = SecretKeys.cloud(p.name);
+      final old = legacy[p] ?? '';
+      try {
+        if (old.isEmpty) {
+          c.apiKey = ((await v.read(key)) ?? '').trim();
+          if (c.apiKey.isNotEmpty && await v.isSessionOnly(key)) failed.add(key);
+        } else {
+          final persisted = ((await v.readPersisted(key)) ?? '').trim();
+          if (persisted.isNotEmpty) {
+            // Zaten taşınmış; JSON'daki eski kopya (ör. .bak'tan dönen) yalnızca silinecek.
+            c.apiKey = ((await v.read(key)) ?? persisted).trim();
+          } else {
+            c.apiKey = old;
+            if (!await v.write(key, old)) {
+              failed.add(key);
+              pendingPlain = true;
+              _legacyPlain[p] = old;
+            }
+          }
+        }
+      } catch (e, st2) {
+        CrashGuard.log('Bulut anahtarı okunamadı ($key)', e, st2);
+        if (old.isNotEmpty) {
+          c.apiKey = old;
+          _legacyPlain[p] = old;
+          pendingPlain = true;
+        }
+        failed.add(key);
+      }
       SecretMask.register(c.apiKey);
     }
-    try {
-      await (storage ?? Storage()).saveJson(fileName, {
-        'v': 1,
-        'providers': {for (final e in providers.entries) e.key.name: e.value.toJson()},
+
+    if (legacy.isNotEmpty && !pendingPlain) {
+      // Hepsi güvenli depoda doğrulandı: JSON'u sırsız yeniden yaz, eski düz metin kopyaları sil.
+      try {
+        await _writeJson(st);
+        await purgeSecretFileCopies(st, fileName);
+      } catch (e, st2) {
+        CrashGuard.log('Bulut ayarları sırsız yeniden yazılamadı', e, st2);
+      }
+    } else if (legacy.isEmpty) {
+      // Bozuk dosya kenara alınmışsa içinde eski düz metin anahtar parçası kalmış olabilir.
+      await purgeSecretFileCopies(st, fileName, corruptOnly: true);
+    }
+    if (pendingPlain) _needsPurge = true;
+    secretStatus = failed.isEmpty ? null : SecretStoreUnavailable(keys: failed);
+    return secretStatus;
+  }
+
+  Future<void> _writeJson(Storage st) => st.saveJson(fileName, {
+        'v': 2,
+        'providers': {
+          for (final e in providers.entries)
+            e.key.name: {
+              ...e.value.toJson(),
+              // Yalnızca zaten diskte duran, taşınamamış ve değişmemiş eski anahtar korunur (yeni düz metin yazılmaz).
+              if (_legacyPlain[e.key] != null && _legacyPlain[e.key] == e.value.apiKey.trim())
+                'key': _legacyPlain[e.key],
+            },
+        },
         'order': [for (final p in order) p.name],
         'research': research,
         'hybrid': hybrid,
       });
-    } catch (e, st) {
-      CrashGuard.log('Bulut ayarları yazılamadı', e, st);
+
+  /// Ayarları kaydeder: anahtarlar güvenli depoya (yazıp doğrulayarak), geri kalanı JSON'a gider.
+  /// Güvenli depo yazamazsa anahtar yalnızca bellekte kalır ve [SecretStoreUnavailable] döner.
+  Future<SecretStoreUnavailable?> save([Storage? storage, SecretVault? vault]) async {
+    final st = storage ?? Storage();
+    final v = vault ?? SecretVault.instance;
+    final failed = <String>[];
+    for (final e in providers.entries) {
+      final c = e.value;
+      final key = SecretKeys.cloud(e.key.name);
+      final value = c.apiKey.trim();
+      SecretMask.register(value);
+      try {
+        if (value.isEmpty) {
+          await v.delete(key);
+          _legacyPlain.remove(e.key);
+        } else if (await v.write(key, value)) {
+          _legacyPlain.remove(e.key);
+        } else {
+          failed.add(key);
+        }
+      } catch (err, st2) {
+        CrashGuard.log('Bulut anahtarı kaydedilemedi ($key)', err, st2);
+        failed.add(key);
+      }
+    }
+    try {
+      await _writeJson(st);
+      if (_legacyPlain.isEmpty && _needsPurge) {
+        await purgeSecretFileCopies(st, fileName);
+        _needsPurge = false;
+      }
+    } catch (e, st2) {
+      CrashGuard.log('Bulut ayarları yazılamadı', e, st2);
     }
     CloudEngine.resetCooldowns(); // anahtar/model değişti: bekleme süreleri sıfırlanır
+    secretStatus = failed.isEmpty ? null : SecretStoreUnavailable(keys: failed);
+    return secretStatus;
   }
 }
 

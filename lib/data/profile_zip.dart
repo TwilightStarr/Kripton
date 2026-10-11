@@ -4,6 +4,7 @@ import 'dart:typed_data';
 import 'package:archive/archive.dart';
 
 import '../domain/chat_models.dart';
+import 'secret_mask.dart';
 
 /// Sınırlar (zip bombası / dev dosya koruması).
 const int kProfileMaxZipBytes = 20 * 1024 * 1024;
@@ -101,6 +102,12 @@ ProfileImportResult parseProfileZip(Uint8List bytes, String zipName, {DateTime? 
     }
     if (e == 'html' || e == 'htm') text = _stripTags(text);
     text = text.replaceAll('\u0000', '').trim();
+    // Kullanıcının ZIP'inde yanlışlıkla API anahtarı/token varsa kalıcı profil belleğine ve bulut istemlerine girmez.
+    final masked = SecretMask.redact(text);
+    if (masked != text) {
+      text = masked;
+      skipped.add('$path: sır benzeri değer maskelendi');
+    }
     if (text.isEmpty) {
       skipped.add('$path: boş');
       continue;

@@ -1,5 +1,7 @@
 import 'dart:convert';
 
+import 'secret_mask.dart';
+
 /// Kullanıcıya gösterilecek çökme/çıkış dialog'u (başlık + gövde).
 typedef CrashDialog = ({String title, String body});
 
@@ -61,7 +63,7 @@ CrashDialog? crashDialogFor(
 }) {
   final opLine = (op == null || op.isEmpty)
       ? ''
-      : '\n\nYarım kalan işlem: ${jsonEncode(op)}';
+      : '\n\nYarım kalan işlem: ${SecretMask.redact(jsonEncode(op))}'; // sır sızıntısına karşı maskelenir
   switch (kind) {
     case CrashKind.nativeCrash:
       {

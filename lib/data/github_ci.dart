@@ -6,12 +6,19 @@ import 'dart:io';
 
 import 'package:crypto/crypto.dart';
 
+import 'crash_guard.dart';
 import 'project_snapshot.dart';
+import 'secret_mask.dart';
+import 'secret_store.dart';
 import 'storage.dart';
 
-/// Kullanıcının GitHub ayarları (cihazda `github_ci.json` olarak saklanır).
+/// Kullanıcının GitHub ayarları. Sır olmayan alanlar `github_ci.json` içinde, token güvenli depoda
+/// ([SecretVault], anahtar adı `github.token`) saklanır.
 class GithubCiConfig {
   GithubCiConfig._();
+
+  /// Singleton olmayan, varsayılan değerli yeni örnek (testler ve yalıtılmış kullanım).
+  GithubCiConfig.isolated();
 
   static final GithubCiConfig instance = GithubCiConfig._();
 
@@ -36,34 +43,129 @@ class GithubCiConfig {
   bool get usable =>
       token.trim().isNotEmpty && _repoRe.hasMatch(repo.trim()) && _branchRe.hasMatch(branch.trim());
 
-  Future<void> load([Storage? storage]) async {
+  /// Güvenli depo kullanılamadığında doldurulur (arayüz gösterebilir); sorun yoksa null.
+  SecretStoreUnavailable? secretStatus;
+
+  /// Henüz güvenli depoya taşınamamış, eski JSON'da duran düz metin token.
+  String _legacyPlain = '';
+
+  /// Taşınamayan eski düz metin diskte kaldıysa: sonraki başarılı kayıtta `.bak`/`.corrupt` kopyaları silinir.
+  bool _needsPurge = false;
+
+  /// Ayarları yükler. Eski JSON'da düz metin token varsa güvenli depoya taşır: yaz → geri oku → aynı mı
+  /// doğrula → ancak o zaman JSON'u sırsız yeniden yaz. Doğrulama başarısızsa eski JSON'a dokunulmaz ve
+  /// token yalnızca oturum belleğinde tutulur. Güvenli depo kullanılamıyorsa [SecretStoreUnavailable] döner.
+  Future<SecretStoreUnavailable?> load([Storage? storage, SecretVault? vault]) async {
+    final st = storage ?? Storage();
+    final v = vault ?? SecretVault.instance;
+    var legacy = '';
     try {
-      final raw = await (storage ?? Storage()).loadJson(fileName);
-      if (raw is! Map) return;
-      token = (raw['token'] as String?) ?? '';
-      repo = (raw['repo'] as String?) ?? '';
-      final b = (raw['branch'] as String?)?.trim() ?? '';
-      branch = b.isEmpty ? 'kripton-ci' : b;
-      runTests = raw['runTests'] != false;
-      buildApk = raw['buildApk'] != false;
-    } catch (_) {
+      final raw = await st.loadJson(fileName);
+      if (raw is Map) {
+        final t = raw['token'];
+        if (t is String && t.trim().isNotEmpty) {
+          legacy = t.trim();
+          SecretMask.register(legacy);
+        }
+        repo = (raw['repo'] as String?) ?? '';
+        final b = (raw['branch'] as String?)?.trim() ?? '';
+        branch = b.isEmpty ? 'kripton-ci' : b;
+        runTests = raw['runTests'] != false;
+        buildApk = raw['buildApk'] != false;
+      }
+    } catch (e, st2) {
       // Bozuk dosya: varsayılanlarla devam.
+      CrashGuard.log('GitHub ayarları okunamadı', e, st2);
     }
+
+    var failed = false;
+    _legacyPlain = '';
+    try {
+      if (legacy.isEmpty) {
+        token = ((await v.read(SecretKeys.githubToken)) ?? '').trim();
+        if (token.isNotEmpty && await v.isSessionOnly(SecretKeys.githubToken)) failed = true;
+      } else {
+        final persisted = ((await v.readPersisted(SecretKeys.githubToken)) ?? '').trim();
+        if (persisted.isNotEmpty) {
+          // Zaten taşınmış; JSON'daki eski kopya (ör. .bak'tan dönen) yalnızca silinecek.
+          token = ((await v.read(SecretKeys.githubToken)) ?? persisted).trim();
+        } else {
+          token = legacy;
+          if (!await v.write(SecretKeys.githubToken, legacy)) {
+            failed = true;
+            _legacyPlain = legacy;
+          }
+        }
+      }
+    } catch (e, st2) {
+      CrashGuard.log('GitHub token okunamadı', e, st2);
+      failed = true;
+      if (legacy.isNotEmpty) {
+        token = legacy;
+        _legacyPlain = legacy;
+      }
+    }
+    SecretMask.register(token);
+
+    if (legacy.isNotEmpty && _legacyPlain.isEmpty) {
+      // Token güvenli depoda doğrulandı: JSON'u sırsız yeniden yaz, eski düz metin kopyaları sil.
+      try {
+        await _writeJson(st);
+        await purgeSecretFileCopies(st, fileName);
+      } catch (e, st2) {
+        CrashGuard.log('GitHub ayarları sırsız yeniden yazılamadı', e, st2);
+      }
+    } else if (legacy.isEmpty) {
+      await purgeSecretFileCopies(st, fileName, corruptOnly: true);
+    }
+    if (_legacyPlain.isNotEmpty) _needsPurge = true;
+    secretStatus = failed ? const SecretStoreUnavailable(keys: [SecretKeys.githubToken]) : null;
+    return secretStatus;
   }
 
-  Future<void> save([Storage? storage]) async {
-    try {
-      await (storage ?? Storage()).saveJson(fileName, {
-        'v': 1,
-        'token': token.trim(),
+  Future<void> _writeJson(Storage st) => st.saveJson(fileName, {
+        'v': 2,
+        // Yalnızca zaten diskte duran, taşınamamış ve değişmemiş eski token korunur (yeni düz metin yazılmaz).
+        if (_legacyPlain.isNotEmpty && _legacyPlain == token.trim()) 'token': _legacyPlain,
         'repo': repo.trim(),
         'branch': branch.trim(),
         'runTests': runTests,
         'buildApk': buildApk,
       });
-    } catch (_) {
-      // Yazılamazsa ayarlar yalnızca bu oturumda geçerli olur.
+
+  /// Ayarları kaydeder: token güvenli depoya (yazıp doğrulayarak), geri kalanı JSON'a gider.
+  /// Güvenli depo yazamazsa token yalnızca bellekte kalır ve [SecretStoreUnavailable] döner.
+  Future<SecretStoreUnavailable?> save([Storage? storage, SecretVault? vault]) async {
+    final st = storage ?? Storage();
+    final v = vault ?? SecretVault.instance;
+    final value = token.trim();
+    SecretMask.register(value);
+    var failed = false;
+    try {
+      if (value.isEmpty) {
+        await v.delete(SecretKeys.githubToken);
+        _legacyPlain = '';
+      } else if (await v.write(SecretKeys.githubToken, value)) {
+        _legacyPlain = '';
+      } else {
+        failed = true;
+      }
+    } catch (e, st2) {
+      CrashGuard.log('GitHub token kaydedilemedi', e, st2);
+      failed = true;
     }
+    try {
+      await _writeJson(st);
+      if (_legacyPlain.isEmpty && _needsPurge) {
+        await purgeSecretFileCopies(st, fileName);
+        _needsPurge = false;
+      }
+    } catch (e, st2) {
+      // Yazılamazsa ayarlar yalnızca bu oturumda geçerli olur.
+      CrashGuard.log('GitHub ayarları yazılamadı', e, st2);
+    }
+    secretStatus = failed ? const SecretStoreUnavailable(keys: [SecretKeys.githubToken]) : null;
+    return secretStatus;
   }
 }
 
