@@ -1,3 +1,4 @@
+// Değişiklik (Görev 2/10): GithubHttpRequest/GithubHttpResponse/GithubHttpSender, githubHttpSend ve githubRetryAfterFrom paylaşıma eklendi (yalnızca ekleme; push() ve GithubCi'ye dokunulmadı).
 // Flutter modu: projeyi GitHub'a (özel bir dala) gönderir, Actions üzerinde GERÇEK
 // `flutter pub get` / `flutter analyze` / `flutter test` / `flutter build apk` çalıştırır ve
 // araç çıktısını AYNEN (kırpmadan) geri okur. Yeni paket gerekmez (dart:io HttpClient).
@@ -445,6 +446,90 @@ class CiTransientException implements Exception {
 
   @override
   String toString() => message;
+}
+
+// ---- Paylaşılan HTTP yardımcıları (Görev 2/10: DevRepoClient burayı kullanır) ----
+
+/// Ham HTTP isteği. Ağ katmanı testte sahte bir [GithubHttpSender] ile değiştirilebilir.
+class GithubHttpRequest {
+  const GithubHttpRequest({
+    required this.method,
+    required this.uri,
+    this.headers = const <String, String>{},
+    this.body,
+    this.timeout = const Duration(seconds: 90),
+  });
+
+  final String method;
+  final Uri uri;
+  final Map<String, String> headers;
+  final List<int>? body;
+  final Duration timeout;
+}
+
+/// Ham HTTP yanıtı; başlık adları küçük harfe çevrilir.
+class GithubHttpResponse {
+  GithubHttpResponse(this.status, this.body, {Map<String, String>? headers})
+      : headers = <String, String>{
+          for (final e in (headers ?? const <String, String>{}).entries) e.key.toLowerCase(): e.value,
+        };
+
+  final int status;
+  final String body;
+  final Map<String, String> headers;
+
+  String? header(String name) => headers[name.toLowerCase()];
+}
+
+/// HTTP gönderici. 4xx/5xx için istisna ATMAZ; ağ hatalarında dart:io istisnası fırlatır.
+typedef GithubHttpSender = Future<GithubHttpResponse> Function(GithubHttpRequest request);
+
+/// Varsayılan gönderici (dart:io HttpClient; [GithubCi] ile aynı zaman aşımı ve User-Agent).
+Future<GithubHttpResponse> githubHttpSend(GithubHttpRequest r) async {
+  final client = HttpClient()..connectionTimeout = const Duration(seconds: 30);
+  try {
+    final req = await client.openUrl(r.method, r.uri).timeout(r.timeout);
+    req.headers.set(HttpHeaders.userAgentHeader, 'kripton-dev-mode');
+    r.headers.forEach((k, v) => req.headers.set(k, v));
+    final body = r.body;
+    if (body != null) {
+      req.contentLength = body.length;
+      req.add(body);
+    }
+    final resp = await req.close().timeout(r.timeout);
+    final bb = BytesBuilder(copy: false);
+    await for (final chunk in resp.timeout(r.timeout)) {
+      bb.add(chunk);
+    }
+    final headers = <String, String>{};
+    resp.headers.forEach((name, values) {
+      headers[name] = values.join(', ');
+    });
+    return GithubHttpResponse(resp.statusCode, utf8.decode(bb.takeBytes(), allowMalformed: true),
+        headers: headers);
+  } finally {
+    client.close(force: true);
+  }
+}
+
+/// Hız sınırı bekleme süresi ([GithubCi] ile aynı kural): Retry-After, `x-ratelimit-remaining: 0` +
+/// reset, ya da 429 için 1 dakika. Sınır işareti yoksa null.
+Duration? githubRetryAfterFrom({
+  required int status,
+  String? retryAfter,
+  String? remaining,
+  String? reset,
+  DateTime? now,
+}) {
+  final ra = int.tryParse(retryAfter ?? '');
+  final rs = int.tryParse(reset ?? '');
+  if (ra != null) return Duration(seconds: ra < 5 ? 5 : ra);
+  if (remaining == '0' && rs != null) {
+    final secs = rs - (now ?? DateTime.now()).millisecondsSinceEpoch ~/ 1000;
+    return Duration(seconds: secs < 5 ? 5 : (secs > 3600 ? 3600 : secs));
+  }
+  if (status == 429) return const Duration(minutes: 1);
+  return null;
 }
 
 /// GitHub Actions ile gerçek Flutter denetimi.

@@ -53,3 +53,64 @@ SecretMask.exportKnown() -> List<String>; SecretMask.registerAll(Iterable<String
 - `CrashGuard.beginOp` (kapsam dışı) `last_op.json` dosyasını maskesiz yazar; alanlara sır konmamalı. `telemetry_*` dosyaları (kapsam dışı) dosyaya yazmıyor, ancak denetlenmedi derinlemesine.
 - `profile_zip` ve iş akışı içe aktarma isolate'ında yalnızca kalıp tabanlı maskeleme çalışır (kayıtlı sırlar dışa aktarmada taşınır, profil içe aktarmada taşınmaz). `Bearer ...` ve `api_key=...` kalıpları düz yazıda yanlış pozitif üretebilir (kullanıcıya "maskelendi" olarak bildirilir).
 - Arayüz (`cloud_settings_sheet`, `dev_mode_page`) henüz `secretStatus` göstermiyor (sonraki prompt).
+
+
+## GÖREV 2/10: GitHub depo katmanı (DevRepoClient)
+
+### Yapılanlar
+- `lib/data/github_repo.dart` (YENİ): `DevRepoClient` — verifyAccess, createWorkBranch, loadSnapshot(+WithInfo), commitChanges (base_tree + parent, force:false), revertTo (yeni commit, geçmiş silinmez), openPullRequest, mergePullRequest (yalnızca onayla).
+- `lib/data/github_ci.dart`: yalnızca EKLEME (silinen satır 0): `GithubHttpRequest`, `GithubHttpResponse`, `GithubHttpSender`, `githubHttpSend`, `githubRetryAfterFrom`. `GithubCi.push` ve geri kalanına dokunulmadı.
+- `test/github_repo_test.dart` (YENİ): bellekte sahte GitHub (ref/commit/iç içe ağaç/blob/PR); gerçek ağ yok.
+- Güvenlik değişmezleri kodda: yazma yalnızca `kripton/` dallarına ve default_branch'e asla (varsayılan dal `kripton/` ile başlasa bile); `force` yalnızca `false` gönderilir; `.github/workflows` yazımı `allowWorkflowEdits` olmadan reddedilir; `..`, mutlak yol, `\`, sürücü harfi, `.git`, kontrol karakteri reddedilir; tek committe en çok 200 dosya / 4 MB; commit içeriğinde kayıtlı sır varsa commit reddedilir; commit/PR metinleri `SecretMask.redact`'ten geçer; hata gövdeleri maskelenir.
+
+### Public API (sonraki agent için)
+```dart
+// lib/data/github_repo.dart
+const kWorkBranchPrefix = 'kripton/'; const kWorkBranchNamePrefix = 'kripton/dev-'; const kTokenPermissionHint;
+class DevRepoException implements Exception { String message; }
+class DevPolicyException extends DevRepoException {}           // güvenlik kuralı ihlali (ağa yazma gitmeden)
+class DevConflictException extends DevRepoException { String branch, expectedSha; String? actualSha; }
+enum RepoAccessCode { tokenGecersiz, depoBulunamadi, yazmaYetkisiYok, arsivlenmis, actionsKapali, hizSiniri }
+class RepoAccessReport { List<RepoAccessIssue> issues; List<String> warnings; String? login; List<String>? scopes;
+  bool? isPrivate, archived, canPush, actionsEnabled; String? defaultBranch; bool get ok; bool has(RepoAccessCode); String get summary; }
+class RepoAccessIssue { RepoAccessCode code; String message; }
+class WorkBranch { String name, headSha, baseBranch, baseSha; bool resumed; }
+class RepoLoadResult { ProjectSnapshot snapshot; String headSha; RepoLoadStats stats; }
+class RepoLoadStats { int filesRead, skippedBinary, skippedTooLarge, skippedOverLimit, skippedExcluded, skippedSpecial, blobsDownloaded, blobsFromCache; bool truncatedTree, fromCache; }
+class PullRequestInfo { int number; String htmlUrl, state, headRef, baseRef, headSha; bool existing; }
+class DevRepoClient {
+  DevRepoClient({required String repo, required String token, GithubHttpSender? send, bool allowWorkflowEdits = false,
+    int maxFilesPerCommit = 200, int maxBytesPerCommit = 4 MB, int maxRetries = 3, int maxRateLimitRetries = 3,
+    Duration maxRateLimitWait = 10 dk, int blobConcurrency = 6, Future<void> Function(Duration)? sleep,
+    bool Function()? cancelled, Future<void>? onCancel, DateTime Function()? now});
+  factory DevRepoClient.fromConfig(GithubCiConfig cfg, {send, allowWorkflowEdits, sleep, cancelled, onCancel, now});
+  static String normalizePath(String raw);                      // DevPolicyException fırlatır
+  Future<RepoAccessReport> verifyAccess();
+  Future<WorkBranch> createWorkBranch(String baseBranch, {String? name});
+  Future<ProjectSnapshot> loadSnapshot(String branch);
+  Future<RepoLoadResult> loadSnapshotWithInfo(String branch);   // headSha -> commitChanges.expectedHeadSha
+  Future<String> commitChanges(String branch, String expectedHeadSha, Map<String,String?> changes, String message);
+  Future<String> revertTo(String branch, String targetSha, String message, {String? expectedHeadSha});
+  Future<PullRequestInfo> openPullRequest(String head, String base, String title, String body, {bool draft = false});
+  Future<bool> mergePullRequest(int number, {required bool confirmed, required String expectedHeadSha, String method = 'merge'});
+}
+// lib/data/github_ci.dart
+typedef GithubHttpSender = Future<GithubHttpResponse> Function(GithubHttpRequest request);
+Future<GithubHttpResponse> githubHttpSend(GithubHttpRequest r); Duration? githubRetryAfterFrom({...});
+```
+- Kullanım: `loadSnapshotWithInfo` -> `headSha`; her `commitChanges` çağrısından dönen SHA bir sonrakinin `expectedHeadSha`'sıdır. `DevConflictException` gelirse dalı yeniden yükle.
+- İstisnalar: ağ/5xx tükenince `CiTransientException`/`CiHttpException`; iptalde `CiCancelledException`; hız sınırı çok uzunsa `CiHttpException(retryAfter: dolu)`.
+
+### DOĞRULANAMADI
+- `dart format`, `flutter analyze`, `flutter test` ÇALIŞTIRILAMADI (ortamda Dart/Flutter SDK yok, ağ kapalı). Kod ve testler derlenmedi/çalıştırılmadı; yalnızca elle gözden geçirildi.
+- Gerçek GitHub davranışı (sahte sunucu varsayımları): `git/ref/heads/{dal}` ETag/304, `compare/{a}...{b}` status değerleri (`ahead`/`identical`), `git/trees` `sha: null` ile silme, boş blob (`content:'' base64`), `/actions/permissions` yetki yanıtları, PR 422 "zaten var" ayrımı.
+- Fine-grained token'da `permissions.push` alanının her zaman dolu geldiği varsayıldı (yoksa yazmaYetkisiYok raporlanır).
+
+### Bilinen riskler
+- `mergePullRequest` varsayılan dalı değiştirebilen TEK yoldur (ref güncellemesi değil, GitHub PR birleştirmesi); `confirmed: true` + güncel uç SHA + `kripton/` baş dal + aynı depo şartı vardır. Arayüz bunu yalnızca kullanıcı onayıyla çağırmalı.
+- `loadSnapshot` ikili ve >400 KB dosyaları atlar; dönen `ProjectSnapshot.binary` boştur (ZIP dışa aktarımı ikilileri içermez).
+- `.sh` dışındaki mevcut çalıştırılabilir dosyalar içerik değişince 100644 moduna düşer.
+- `project_snapshot.dart`'taki `_skipDirs`/uzantı mantığı özel olduğundan `github_repo.dart` içinde kopyalandı (dosyaya dokunulmadı); biri değişirse diğeri de güncellenmeli.
+- Yeniden deneme jitter'sizdir (deterministik: 0,5/1/2 sn). POST pulls/merge ağ hatasında yeniden denenmez (çift işlem riski).
+- Commit içeriğinde yalnızca KAYITLI sırlar aranır (kalıp tabanlı arama kodda yanlış pozitif üretirdi).
+- Kapsam dışı: `GithubCi.push` hâlâ force + ebeveynsiz commit kullanıyor (istendiği gibi dokunulmadı); sonraki görevde dev modu bu yoldan çıkarılmalı.
