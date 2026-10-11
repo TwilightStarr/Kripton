@@ -19,15 +19,37 @@ import 'token_budget.dart';
 
 class CancelToken {
   final Completer<void> _done = Completer<void>();
+  final Map<Completer<void>, Timer> _sleepers = <Completer<void>, Timer>{};
 
   bool get cancelled => _done.isCompleted;
 
   /// İptal anında tamamlanır; bekleyen işlemler `Future.any` ile bunu dinler.
   Future<void> get onCancel => _done.future;
 
+  /// [d] kadar bekler; iptalde hemen döner. `Future.any([delayed, onCancel])` gibi her çağrıda
+  /// [onCancel] üzerinde dinleyici BİRİKTİRMEZ (saatler/günler süren oturumlarda bellek büyümez).
+  Future<void> wait(Duration d) {
+    if (cancelled || d <= Duration.zero) return Future<void>.value();
+    final c = Completer<void>();
+    _sleepers[c] = Timer(d, () {
+      _sleepers.remove(c);
+      if (!c.isCompleted) c.complete();
+    });
+    return c.future;
+  }
+
+  /// Bekleyen uyku sayısı (sızıntı testi için).
+  int get pendingWaits => _sleepers.length;
+
   /// İdempotent: ikinci ve sonraki çağrılar etkisizdir.
   void cancel() {
-    if (!_done.isCompleted) _done.complete();
+    if (_done.isCompleted) return;
+    _done.complete();
+    for (final e in _sleepers.entries.toList()) {
+      e.value.cancel();
+      if (!e.key.isCompleted) e.key.complete();
+    }
+    _sleepers.clear();
   }
 }
 
@@ -345,6 +367,11 @@ class WorkflowRunner {
   /// Doğrulama başarısız olunca üretici ajanın en çok kaç kez yeniden çalıştırılacağı (>= 1).
   int correctionAttempts = kMaxCorrectionAttempts;
 
+  /// Üretim akışında bu süre boyunca HİÇ olay (token/hata/bitiş) gelmezse üretim takılmış sayılır:
+  /// motor durdurulur ve hata verilir (aksi halde native takılması akışı sonsuza dek bekletir).
+  /// [Duration.zero] bekçiyi kapatır.
+  Duration streamIdleTimeout = const Duration(minutes: 20);
+
   // Geliştirilen mevcut proje (kendini geliştirme / proje düzenleme); yoksa null. run() başında yüklenir.
   ProjectSnapshot? _base;
 
@@ -360,10 +387,7 @@ class WorkflowRunner {
 
   /// Bekleme sırasında iptal gelirse beklemeden çıkar.
   Future<void> _pause(int ms, CancelToken ct) async {
-    await Future.any<void>([
-      Future<void>.delayed(Duration(milliseconds: ms)),
-      ct.onCancel,
-    ]);
+    await ct.wait(Duration(milliseconds: ms));
     _check(ct);
   }
 
@@ -664,10 +688,13 @@ class WorkflowRunner {
     final promptTok = estimateTokens(prompt, tpl);
     // Bu ajanın örnekleme ayarları native çağrıya gider (bitişte finally'de sıfırlanır).
     SamplingScope.current = a.inference.clamped();
+    var lastEventAt = DateTime.now();
     final sub = _engine
         .generate(prompt, maxTokens: maxNew)
         .listen(
           (t) {
+            try {
+            lastEventAt = DateTime.now();
             if (ct.cancelled || thinkCut) return;
             b.write(t);
             cb.token(t);
@@ -693,7 +720,7 @@ class WorkflowRunner {
               peakRam = math.max(peakRam, MemInfo.rssMb());
               DeviceThermal.status().then((v) {
                 if (v != null) _gov.osThermalStatus = v;
-              });
+              }).catchError((Object _) {});
             }
             if (isR1) {
               guard.add(t);
@@ -713,6 +740,10 @@ class WorkflowRunner {
                 done.complete();
               }
             }
+            } catch (e, st) {
+              // Dinleyici içindeki beklenmeyen hata yakalanmamış istisna olarak sızmasın.
+              if (!done.isCompleted) done.completeError(e, st);
+            }
           },
           onError: (Object e, StackTrace st) {
             if (!done.isCompleted) done.completeError(e, st);
@@ -722,10 +753,24 @@ class WorkflowRunner {
           },
           cancelOnError: true,
         );
+    Timer? watchdog;
+    final idle = streamIdleTimeout;
+    if (idle > Duration.zero) {
+      final tick = Duration(milliseconds: math.max(10, math.min(5000, idle.inMilliseconds ~/ 4)));
+      watchdog = Timer.periodic(tick, (_) {
+        if (done.isCompleted || ct.cancelled) return;
+        if (DateTime.now().difference(lastEventAt) < idle) return;
+        final span = idle.inSeconds >= 1 ? '${idle.inSeconds} sn' : '${idle.inMilliseconds} ms';
+        _log(cb, a.name, 'Model $span boyunca çıktı vermedi; üretim durduruluyor.', LogType.warning);
+        _engine.stop().timeout(const Duration(seconds: 2)).catchError((Object _) {});
+        done.completeError(StateError('Model $span boyunca yanıt vermedi (takıldı); üretim durduruldu.'));
+      });
+    }
     try {
       // Token beklemeden: ya akış biter/hata verir ya da iptal anında çıkılır.
       await Future.any<void>([done.future, ct.onCancel]);
     } finally {
+      watchdog?.cancel();
       try {
         await sub.cancel().timeout(const Duration(seconds: 1));
       } catch (_) {}
@@ -758,7 +803,7 @@ class WorkflowRunner {
           promptTokens: promptTok,
           genTokens: events,
         ),
-      ),
+      ).catchError((Object _) {}),
     );
     return _clean(b.toString());
   }

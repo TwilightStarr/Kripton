@@ -3,6 +3,8 @@ import 'dart:io';
 
 import 'package:path_provider/path_provider.dart';
 
+import 'secret_mask.dart';
+
 /// documents/crash.log (en çok 200 KB), documents/last_op.json ve
 /// documents/crash_state.json yönetimi.
 /// Yapılandırılmadıysa (testler) tüm çağrılar sessizce no-op'tur.
@@ -81,7 +83,10 @@ class CrashGuard {
     final d = _dir;
     if (d == null) return;
     try {
-      final entry = utf8.encode('[${DateTime.now().toIso8601String()}] $source: $error\n${st ?? ''}\n\n');
+      // API anahtarları hiçbir koşulda düz metin olarak günlüğe yazılmaz.
+      final entry = utf8.encode(
+        SecretMask.redact('[${DateTime.now().toIso8601String()}] $source: $error\n${st ?? ''}\n\n'),
+      );
       final f = File('${d.path}/crash.log');
       final old = f.existsSync() ? f.readAsBytesSync() : const <int>[];
       final room = maxLogBytes - entry.length;
@@ -98,7 +103,7 @@ class CrashGuard {
     if (d == null) return '';
     try {
       final f = File('${d.path}/crash.log');
-      return f.existsSync() ? await f.readAsString() : '';
+      return f.existsSync() ? SecretMask.redact(await f.readAsString()) : '';
     } catch (_) {
       return '';
     }

@@ -1,9 +1,10 @@
-import 'dart:convert';
 import 'dart:io';
 
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:path/path.dart' as p;
 import 'package:path_provider/path_provider.dart';
+
+import '../data/atomic_file.dart';
 
 /// Bir üretimin (ajan adımı) ölçümleri.
 class PerfSample {
@@ -119,9 +120,13 @@ class PerfLog {
     _loaded = true;
     try {
       final f = await _file();
-      if (await f.exists()) {
-        final l = jsonDecode(await f.readAsString()) as List;
-        samples.addAll(l.map((e) => PerfSample.fromJson(e as Map<String, dynamic>)));
+      final l = await AtomicFile.readJson(f.path);
+      if (l is List) {
+        for (final e in l) {
+          try {
+            samples.add(PerfSample.fromJson(Map<String, dynamic>.from(e as Map)));
+          } catch (_) {} // bozuk tek kayıt diğerlerini kaybettirmez
+        }
       }
     } catch (_) {}
   }
@@ -131,7 +136,7 @@ class PerfLog {
     samples.add(s);
     if (samples.length > 50) samples.removeRange(0, samples.length - 50);
     try {
-      await (await _file()).writeAsString(jsonEncode([for (final x in samples) x.toJson()]));
+      await AtomicFile.writeJson((await _file()).path, [for (final x in samples) x.toJson()]);
     } catch (_) {}
   }
 

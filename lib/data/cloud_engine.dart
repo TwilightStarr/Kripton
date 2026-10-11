@@ -9,6 +9,7 @@ import '../domain/entities.dart';
 import 'chatml_parser.dart';
 import 'crash_guard.dart';
 import 'llm_engine.dart';
+import 'secret_mask.dart';
 import 'storage.dart';
 
 /// Bulut modellerinin sahte "dosya yolu" öneki (örn. `cloud:auto`).
@@ -71,6 +72,24 @@ CloudProvider? _providerById(String id) {
   return null;
 }
 
+/// Model adındaki sık hataları temizler: baştaki/sondaki ve içteki boşluklar (NBSP, sıfır genişlikli
+/// karakterler dahil), tırnaklar, `models/` öneki. Sağlayıcının bilinen model listesi ([known]) verilirse
+/// büyük/küçük harf farkı listedeki yazıma çevrilir; liste yoksa küçük harfe indirilir (Gemini, Groq ve
+/// OpenRouter model kimlikleri küçük harflidir). Sonuç boşsa boş metin döner; çağıran varsayılana düşer.
+String normalizeModelName(String raw, {Iterable<String>? known}) {
+  var s = raw.replaceAll(RegExp(r'[\s\u00A0\u200B\u200C\u200D\uFEFF]+'), '');
+  s = s.replaceAll(RegExp('^["\'`]+|["\'`]+\$'), '');
+  if (s.toLowerCase().startsWith('models/')) s = s.substring(7);
+  if (s.isEmpty) return '';
+  final lower = s.toLowerCase();
+  if (known != null) {
+    for (final k in known) {
+      if (k.toLowerCase() == lower) return k;
+    }
+  }
+  return lower;
+}
+
 class CloudProviderConfig {
   CloudProviderConfig({this.apiKey = '', required this.model, this.enabled = true});
 
@@ -80,12 +99,18 @@ class CloudProviderConfig {
 
   bool get usable => enabled && apiKey.trim().isNotEmpty && model.trim().isNotEmpty;
 
+  @override
+  String toString() => 'CloudProviderConfig(model: $model, enabled: $enabled, key: ${SecretMask.placeholder})';
+
   Map<String, dynamic> toJson() => {'key': apiKey, 'model': model, 'enabled': enabled};
 }
 
 /// Kalıcı bulut ayarları (API anahtarları uygulamanın özel klasöründe `cloud_config.json` içinde durur).
 class CloudConfig {
   CloudConfig._();
+
+  /// Singleton olmayan, varsayılan değerli yeni örnek (testler ve yalıtılmış kullanım).
+  CloudConfig.isolated();
 
   static final CloudConfig instance = CloudConfig._();
 
@@ -116,8 +141,11 @@ class CloudConfig {
           final m = prov[p.name];
           if (m is! Map) continue;
           final c = providers[p]!;
-          c.apiKey = (m['key'] as String?) ?? '';
-          final model = (m['model'] as String?)?.trim() ?? '';
+          final key = m['key'];
+          c.apiKey = key is String ? key.trim() : '';
+          SecretMask.register(c.apiKey);
+          final modelRaw = m['model'];
+          final model = normalizeModelName(modelRaw is String ? modelRaw : '');
           c.model = model.isEmpty ? p.defaultModel : model;
           c.enabled = m['enabled'] != false;
         }
@@ -136,12 +164,16 @@ class CloudConfig {
       }
       research = raw['research'] != false;
       hybrid = raw['hybrid'] != false;
-    } catch (_) {
-      // Bozuk dosya: varsayılanlarla devam.
+    } catch (e, st) {
+      // Beklenmeyen biçim: varsayılanlarla devam; uygulama açılışta çökmez.
+      CrashGuard.log('Bulut ayarları okunamadı', e, st);
     }
   }
 
   Future<void> save([Storage? storage]) async {
+    for (final c in providers.values) {
+      SecretMask.register(c.apiKey);
+    }
     try {
       await (storage ?? Storage()).saveJson(fileName, {
         'v': 1,
@@ -150,7 +182,9 @@ class CloudConfig {
         'research': research,
         'hybrid': hybrid,
       });
-    } catch (_) {}
+    } catch (e, st) {
+      CrashGuard.log('Bulut ayarları yazılamadı', e, st);
+    }
     CloudEngine.resetCooldowns(); // anahtar/model değişti: bekleme süreleri sıfırlanır
   }
 }
@@ -222,21 +256,137 @@ List<GgufModel> cloudModels() => const [
       ),
     ];
 
-/// Sağlayıcı hatası. [cooldownMs] bu sağlayıcının ne kadar süre denenmeyeceğini belirler.
+final RegExp _wsRe = RegExp(r'\s');
+
+/// Sağlayıcı hatasının sınıfı; bekleme (cooldown) politikasını belirler.
+enum _Kind { rateLimit, server, network, timeout, auth, notFound, badRequest, tooLarge, blocked, empty, badResponse, other }
+
+/// Yeniden deneme / zaman aşımı / geri çekilme ayarları. Varsayılanlar üretim içindir;
+/// testler çok kısa değerlerle kendi politikasını verir.
+class CloudRetryPolicy {
+  const CloudRetryPolicy({
+    this.maxAttempts = kCloudMaxAttempts,
+    this.baseDelayMs = 15000,
+    this.maxDelayMs = 10 * 60 * 1000,
+    this.jitter = 0.2,
+    this.minCooldownMs = 15000,
+    this.minWaitMs = 500,
+    this.paceScale = 1.0,
+    this.maxWait = kCloudMaxWait,
+    this.connectTimeout = const Duration(seconds: 30),
+    this.headersTimeout = const Duration(seconds: 120),
+    this.idleTimeout = const Duration(seconds: 120),
+    this.errorBodyTimeout = const Duration(seconds: 20),
+    this.maxStreamDuration = const Duration(minutes: 20),
+    this.researchAttempts = 3,
+  });
+
+  /// Tek üretimde en çok sağlayıcı denemesi (sonsuz döngü koruması).
+  final int maxAttempts;
+
+  /// İlk ardışık başarısızlıktan sonraki bekleme (ms); her yeni başarısızlıkta ikiye katlanır.
+  final int baseDelayMs;
+  final int maxDelayMs;
+
+  /// 0..1: beklemeye uygulanan rastgele sapma oranı (aynı anda başlayan istekler eşzamanlanmasın).
+  final double jitter;
+
+  /// Her hata sonrası sağlayıcının en az bu kadar (ms) dinlendirilmesi.
+  final int minCooldownMs;
+
+  /// Tüm sağlayıcılar beklemedeyken döngünün en kısa uyku süresi (ms).
+  final int minWaitMs;
+
+  /// Sağlayıcıların istek aralığı ([CloudProviderInfo.minGapMs]) çarpanı; 0 = aralık yok.
+  final double paceScale;
+
+  /// Tüm sağlayıcılar kota beklerken tek üretimin en çok bekleyeceği süre.
+  final Duration maxWait;
+  final Duration connectTimeout;
+  final Duration headersTimeout;
+
+  /// Akışta iki olay arasında izin verilen en uzun sessizlik.
+  final Duration idleTimeout;
+  final Duration errorBodyTimeout;
+
+  /// Tek akışın toplam en uzun süresi (yavaş damlatan sunucuya karşı).
+  final Duration maxStreamDuration;
+
+  /// [cloudResearch] için en çok deneme.
+  final int researchAttempts;
+
+  /// [failures]. ardışık başarısızlıktan sonra beklenecek süre: `base * 2^(n-1)`, tavanlı, ± sapma.
+  int backoffMs(int failures, math.Random rnd) {
+    final n = failures < 1 ? 1 : (failures > 24 ? 24 : failures);
+    final exp = math.min(maxDelayMs.toDouble(), baseDelayMs.toDouble() * (1 << (n - 1)));
+    final j = jitter <= 0 ? 0.0 : exp * jitter * (rnd.nextDouble() * 2 - 1);
+    final v = (exp + j).round();
+    return v < 0 ? 0 : v;
+  }
+}
+
+/// Bulut isteklerini dışarıdan iptal etmek için (ör. [cloudResearch]).
+class CloudCancelToken {
+  bool _cancelled = false;
+  final List<void Function()> _listeners = <void Function()>[];
+
+  bool get cancelled => _cancelled;
+
+  void cancel() {
+    if (_cancelled) return;
+    _cancelled = true;
+    final ls = List<void Function()>.of(_listeners);
+    _listeners.clear();
+    for (final l in ls) {
+      try {
+        l();
+      } catch (_) {}
+    }
+  }
+
+  void _add(void Function() l) {
+    if (_cancelled) {
+      l();
+    } else {
+      _listeners.add(l);
+    }
+  }
+
+  void _remove(void Function() l) => _listeners.remove(l);
+}
+
+/// Sağlayıcı hatası. Bekleme süresi: [fixedCoolMs] varsa o; yoksa max([hintMs], üstel geri çekilme).
 class _CloudError implements Exception {
-  _CloudError(this.message, this.cooldownMs, {this.emitted = 0});
+  _CloudError(this.message, this.kind, {this.hintMs, this.fixedCoolMs, this.emitted = 0});
 
   final String message;
-  final int cooldownMs;
+  final _Kind kind;
+
+  /// Sunucunun bildirdiği bekleme (Retry-After / retryDelay); yoksa null.
+  final int? hintMs;
+
+  /// Düzeltilmeden geçmeyecek hatalar (anahtar, model adı, geçersiz istek) için sabit bekleme.
+  final int? fixedCoolMs;
+
+  /// Hatadan önce istemciye iletilen GÖRÜNÜR metin uzunluğu.
   final int emitted;
 
   @override
   String toString() => message;
 }
 
+/// Bir üretim/araştırma çalıştırması: iptal, açık HTTP istemcisi ve iptal edilebilir uyku.
 class _CloudRun {
   bool cancelled = false;
   HttpClient? client;
+  Timer? _sleepTimer;
+  Completer<void>? _sleepDone;
+  CloudCancelToken? _token;
+
+  void attach(CloudCancelToken? token) {
+    _token = token;
+    token?._add(cancel);
+  }
 
   void cancel() {
     cancelled = true;
@@ -247,25 +397,137 @@ class _CloudRun {
         c.close(force: true);
       } catch (_) {}
     }
+    _wake();
+  }
+
+  void _wake() {
+    _sleepTimer?.cancel();
+    _sleepTimer = null;
+    final d = _sleepDone;
+    _sleepDone = null;
+    if (d != null && !d.isCompleted) d.complete();
+  }
+
+  /// [ms] kadar bekler; iptalde hemen döner. Dinleyici/zamanlayıcı birikmez.
+  Future<void> sleep(int ms) {
+    if (cancelled || ms <= 0) return Future<void>.value();
+    _wake();
+    final done = Completer<void>();
+    _sleepDone = done;
+    _sleepTimer = Timer(Duration(milliseconds: ms), _wake);
+    return done.future;
+  }
+
+  /// Çalıştırma bittiğinde kaynakları bırakır (idempotent).
+  void dispose() {
+    _wake();
+    _token?._remove(cancel);
+    _token = null;
+    final c = client;
+    client = null;
+    if (c != null) {
+      try {
+        c.close(force: true);
+      } catch (_) {}
+    }
+  }
+}
+
+/// Giden istek tanımı (sağlayıcıya göre kurulur).
+class _CloudRequest {
+  _CloudRequest(this.uri, this.headers, this.body);
+  final Uri uri;
+  final Map<String, String> headers;
+  final Map<String, dynamic> body;
+}
+
+/// TÜM bulut HTTP istekleri buradan geçer: bağlantı/başlık/gövde zaman aşımı, iptalde istemciyi
+/// kapatma, 200 dışı yanıtı sınıflandırılmış [_CloudError]'a çevirme. İstisnaları normalize ETMEZ;
+/// çağıran [CloudEngine._asCloudError] ile tek noktadan çevirir.
+class _CloudHttp {
+  _CloudHttp(this.policy, this.run);
+
+  final CloudRetryPolicy policy;
+  final _CloudRun run;
+
+  Future<T> post<T>(
+    CloudProvider pr,
+    _CloudRequest r, {
+    required Future<T> Function(HttpClientResponse res) onOk,
+  }) async {
+    final client = HttpClient()..connectionTimeout = policy.connectTimeout;
+    run.client = client;
+    try {
+      if (run.cancelled) throw StateError('İstek iptal edildi.');
+      final req = await client.postUrl(r.uri).timeout(policy.connectTimeout);
+      req.headers.set(HttpHeaders.contentTypeHeader, 'application/json; charset=utf-8');
+      req.headers.set(HttpHeaders.acceptHeader, 'text/event-stream');
+      r.headers.forEach(req.headers.set);
+      final bytes = utf8.encode(jsonEncode(r.body));
+      req.contentLength = bytes.length;
+      req.add(bytes);
+      final res = await req.close().timeout(policy.headersTimeout);
+      if (res.statusCode != 200) {
+        final body = await readBody(res, policy.errorBodyTimeout);
+        throw CloudEngine._errorFor(pr, res.statusCode, body, res.headers);
+      }
+      return await onOk(res);
+    } finally {
+      if (identical(run.client, client)) run.client = null;
+      try {
+        client.close(force: true);
+      } catch (_) {}
+    }
+  }
+
+  /// Gövdeyi sınırlı bellekle okur (bozuk UTF-8 hata vermez).
+  static Future<String> readBody(HttpClientResponse res, Duration timeout, {int maxChars = 512 * 1024}) async {
+    final b = StringBuffer();
+    var n = 0;
+    await for (final chunk in res.transform(const Utf8Decoder(allowMalformed: true)).timeout(timeout)) {
+      final room = maxChars - n;
+      if (room <= 0) break;
+      b.write(chunk.length > room ? chunk.substring(0, room) : chunk);
+      n += chunk.length;
+    }
+    return b.toString();
   }
 }
 
 /// Bulut API'lerine bağlanan motor. `cloud:auto` -> ayarlardaki sıra; `cloud:gemini|groq|openrouter` -> yalnızca o sağlayıcı.
 class CloudEngine implements LlmEngine {
-  CloudEngine({CloudConfig? config}) : _config = config ?? CloudConfig.instance;
+  CloudEngine({
+    CloudConfig? config,
+    CloudRetryPolicy policy = const CloudRetryPolicy(),
+    Map<CloudProvider, Uri>? endpoints,
+  })  : _config = config ?? CloudConfig.instance,
+        _policy = policy,
+        _endpoints = endpoints;
 
   final CloudConfig _config;
+  final CloudRetryPolicy _policy;
+
+  /// Sağlayıcı uç noktalarını değiştirir (testler: yerel sahte sunucu). Null = gerçek adresler.
+  final Map<CloudProvider, Uri>? _endpoints;
 
   /// Sağlayıcı -> bu zamana (ms, epoch) kadar denenmez. Motor örnekleri arasında paylaşılır.
   static final Map<CloudProvider, int> _cool = {};
   static final Map<CloudProvider, int> _nextCallMs = {};
 
+  /// Sağlayıcı -> ardışık başarısızlık sayısı (üstel geri çekilme); başarıda sıfırlanır.
+  static final Map<CloudProvider, int> _fails = {};
+  static final Map<CloudProvider, _Kind> _lastKind = {};
+  static final math.Random _rnd = math.Random();
+
   static void resetCooldowns() {
     _cool.clear();
+    _fails.clear();
+    _lastKind.clear();
+    _nextCallMs.clear();
   }
 
   String? _loaded;
-  _CloudRun? _activeRun;
+  final Set<_CloudRun> _runs = <_CloudRun>{};
   int _active = 0;
   Completer<void> _idle = Completer<void>()..complete();
 
@@ -311,14 +573,20 @@ class CloudEngine implements LlmEngine {
     }
   }
 
+  void _cancelAll() {
+    for (final r in List<_CloudRun>.of(_runs)) {
+      r.cancel();
+    }
+  }
+
   @override
   Future<void> stop() async {
-    _activeRun?.cancel();
+    _cancelAll();
   }
 
   @override
   Future<void> dispose() async {
-    _activeRun?.cancel();
+    _cancelAll();
     _loaded = null; // yeniden kullanılabilir (RoutingEngine boşaltma sözleşmesi)
   }
 
@@ -336,8 +604,13 @@ class CloudEngine implements LlmEngine {
     c = StreamController<String>(
       onListen: () {
         _enter();
-        _activeRun = run;
-        unawaited(_drive(run, c, prompt, maxTokens));
+        _runs.add(run);
+        unawaited(
+          _drive(run, c, prompt, maxTokens).catchError((Object e, StackTrace st) {
+            // _drive kendi içinde her şeyi yakalar; buraya yalnızca beklenmeyen bir yarış düşer.
+            CrashGuard.log('Bulut üretim (iç hata)', e.toString(), st);
+          }),
+        );
       },
       onCancel: () {
         run.cancel();
@@ -369,31 +642,52 @@ class CloudEngine implements LlmEngine {
         c.addError(
           e is GenerationFailedException
               ? e
-              : GenerationFailedException('Bulut üretimi başarısız: $e', code: 'CLOUD_GENERATE'),
+              : GenerationFailedException(
+                  'Bulut üretimi başarısız: ${SecretMask.redact(e.toString())}',
+                  code: 'CLOUD_GENERATE',
+                ),
           st,
         );
       }
     } finally {
-      if (identical(_activeRun, run)) _activeRun = null;
-      run.client = null;
+      _runs.remove(run);
+      run.dispose();
       _exit();
       if (!c.isClosed) {
-        try {
-          await c.close();
-        } catch (_) {}
+        // Dinleyici duraklatılmışsa close() tamamlanmayabilir; üretimi bunun için bekletme.
+        unawaited(c.close().catchError((Object _) {}));
       }
     }
   }
 
   static int _nowMs() => DateTime.now().millisecondsSinceEpoch;
 
-  Future<void> _sleep(_CloudRun run, int ms) async {
-    var left = ms;
-    while (left > 0 && !run.cancelled) {
-      final step = math.min(left, 1000);
-      await Future<void>.delayed(Duration(milliseconds: step));
-      left -= step;
+  /// Her türlü istisnayı (ağ, TLS, zaman aşımı, bozuk veri, beklenmeyen) sınıflandırılmış hataya çevirir.
+  static _CloudError _asCloudError(Object e) {
+    if (e is _CloudError) return e;
+    if (e is TimeoutException) return _CloudError('zaman aşımı', _Kind.timeout);
+    if (e is SocketException) {
+      return _CloudError('ağ hatası (${SecretMask.redact(e.message)})', _Kind.network);
     }
+    if (e is TlsException) {
+      return _CloudError('TLS hatası (${SecretMask.redact(e.message)})', _Kind.network);
+    }
+    if (e is HttpException) {
+      return _CloudError('HTTP hatası (${SecretMask.redact(e.message)})', _Kind.network);
+    }
+    if (e is FormatException) {
+      return _CloudError('bozuk yanıt (${SecretMask.redact(e.message)})', _Kind.badResponse);
+    }
+    return _CloudError('beklenmeyen hata (${SecretMask.redact(e.toString())})', _Kind.other);
+  }
+
+  /// Başarısızlığı kaydeder ve sağlayıcıyı üstel geri çekilmeyle dinlendirir.
+  void _registerFailure(CloudProvider pr, _CloudError e) {
+    final fails = (_fails[pr] ?? 0) + 1;
+    _fails[pr] = fails;
+    _lastKind[pr] = e.kind;
+    final cool = e.fixedCoolMs ?? math.max(e.hintMs ?? 0, _policy.backoffMs(fails, _rnd));
+    _cool[pr] = _nowMs() + math.max(_policy.minCooldownMs, cool);
   }
 
   Future<void> _withFailover(
@@ -411,15 +705,18 @@ class CloudEngine implements LlmEngine {
       final now = _nowMs();
       CloudProvider? pick;
       for (final pr in order) {
-        final cfg = _config.providers[pr]!;
-        if (!cfg.usable) continue;
+        final cfg = _config.providers[pr];
+        if (cfg == null || !cfg.usable) continue;
         if ((_cool[pr] ?? 0) <= now) {
           pick = pr;
           break;
         }
       }
       if (pick == null) {
-        final usable = [for (final pr in order) if (_config.providers[pr]!.usable) pr];
+        final usable = [
+          for (final pr in order)
+            if (_config.providers[pr]?.usable ?? false) pr,
+        ];
         if (usable.isEmpty) {
           throw const GenerationFailedException(
             'Hiçbir bulut sağlayıcı için API anahtarı girilmemiş. Geliştirme Modu → Bulut ayarları bölümünden anahtar ekle.',
@@ -430,60 +727,54 @@ class CloudEngine implements LlmEngine {
         for (final pr in usable) {
           soonest = math.min(soonest, _cool[pr] ?? 0);
         }
-        final waitMs = math.max(500, soonest - now);
-        if (now - startedAt + waitMs > kCloudMaxWait.inMilliseconds) {
-          throw GenerationFailedException(
-            'Tüm bulut sağlayıcıların kotası dolu görünüyor (${errors.isEmpty ? 'bilgi yok' : errors.last}). '
-            'Daha sonra yeniden dene veya başka bir sağlayıcı anahtarı ekle.',
-            code: 'CLOUD_QUOTA',
-          );
+        final waitMs = math.max(_policy.minWaitMs, soonest - now);
+        if (now - startedAt + waitMs > _policy.maxWait.inMilliseconds) {
+          final allAuth = usable.every((pr) => _lastKind[pr] == _Kind.auth);
+          final last = errors.isEmpty ? 'bilgi yok' : errors.last;
+          throw allAuth
+              ? GenerationFailedException(
+                  'Bulut API anahtarı reddedildi ($last). Anahtarı Bulut ayarlarından kontrol et.',
+                  code: 'CLOUD_AUTH',
+                )
+              : GenerationFailedException(
+                  'Tüm bulut sağlayıcıların kotası dolu görünüyor ($last). '
+                  'Daha sonra yeniden dene veya başka bir sağlayıcı anahtarı ekle.',
+                  code: 'CLOUD_QUOTA',
+                );
         }
         CrashGuard.log('Bulut', 'Tüm sağlayıcılar beklemede; ${(waitMs / 1000).ceil()} sn bekleniyor', null);
-        await _sleep(run, waitMs);
+        await run.sleep(waitMs);
         continue;
       }
-      if (++attempts > kCloudMaxAttempts) {
+      if (++attempts > _policy.maxAttempts) {
         throw GenerationFailedException(
-          'Bulut üretimi $kCloudMaxAttempts denemede başarısız: ${errors.isEmpty ? 'bilinmeyen hata' : errors.last}',
+          'Bulut üretimi ${_policy.maxAttempts} denemede başarısız: ${errors.isEmpty ? 'bilinmeyen hata' : errors.last}',
           code: 'CLOUD_ATTEMPTS',
         );
       }
       try {
         await _call(run, c, pick, p, maxTokens);
         if (run.cancelled) return;
+        _fails[pick] = 0;
+        _lastKind.remove(pick);
         if (lastProviderLabel != pick.label) {
-          CrashGuard.log('Bulut', 'Sağlayıcı: ${pick.label} (${_config.providers[pick]!.model})', null);
+          CrashGuard.log('Bulut', 'Sağlayıcı: ${pick.label} (${_config.providers[pick]?.model})', null);
         }
         lastProviderLabel = pick.label;
         return;
-      } on _CloudError catch (e) {
+      } catch (e) {
         if (run.cancelled) return;
-        _cool[pick] = _nowMs() + math.max(15000, e.cooldownMs);
-        errors.add('${pick.label}: ${e.message}');
-        CrashGuard.log('Bulut hata', '${pick.label}: ${e.message}', null);
-        if (e.emitted > 0) {
+        final ce = _asCloudError(e);
+        _registerFailure(pick, ce);
+        errors.add('${pick.label}: ${ce.message}');
+        CrashGuard.log('Bulut hata', '${pick.label}: ${ce.message}', null);
+        if (ce.emitted > 0) {
           // Metin kısmen iletildi: başka sağlayıcıyla sürdürmek çıktıyı bozar; üst katman yeniden dener.
           throw GenerationFailedException(
-            'Bulut akışı yarıda kesildi (${pick.label}): ${e.message}',
+            'Bulut akışı yarıda kesildi (${pick.label}): ${ce.message}',
             code: 'CLOUD_MIDSTREAM',
           );
         }
-      } on SocketException catch (e) {
-        if (run.cancelled) return;
-        _cool[pick] = _nowMs() + 30000;
-        errors.add('${pick.label}: ağ hatası (${e.message})');
-      } on TimeoutException {
-        if (run.cancelled) return;
-        _cool[pick] = _nowMs() + 30000;
-        errors.add('${pick.label}: zaman aşımı');
-      } on HandshakeException catch (e) {
-        if (run.cancelled) return;
-        _cool[pick] = _nowMs() + 60000;
-        errors.add('${pick.label}: TLS hatası (${e.message})');
-      } on HttpException catch (e) {
-        if (run.cancelled) return;
-        _cool[pick] = _nowMs() + 30000;
-        errors.add('${pick.label}: HTTP hatası (${e.message})');
       }
     }
   }
@@ -492,8 +783,34 @@ class CloudEngine implements LlmEngine {
   Future<void> _pace(_CloudRun run, CloudProvider pr) async {
     final now = _nowMs();
     final at = _nextCallMs[pr] ?? 0;
-    _nextCallMs[pr] = math.max(now, at) + pr.minGapMs;
-    if (at > now) await _sleep(run, at - now);
+    _nextCallMs[pr] = math.max(now, at) + (pr.minGapMs * _policy.paceScale).round();
+    if (at > now) await run.sleep(at - now);
+  }
+
+  Uri _endpointFor(CloudProvider pr, CloudProviderConfig cfg) {
+    final o = _endpoints?[pr];
+    if (o != null) return o;
+    return switch (pr) {
+      CloudProvider.gemini => Uri.parse(
+          'https://generativelanguage.googleapis.com/v1beta/models/${cfg.model.trim()}:streamGenerateContent?alt=sse',
+        ),
+      CloudProvider.groq => Uri.parse('https://api.groq.com/openai/v1/chat/completions'),
+      CloudProvider.openrouter => Uri.parse('https://openrouter.ai/api/v1/chat/completions'),
+    };
+  }
+
+  _CloudRequest _buildRequest(CloudProvider pr, CloudProviderConfig cfg, ChatMlParse p, int maxTokens) {
+    final Uri uri;
+    try {
+      uri = _endpointFor(pr, cfg);
+    } on FormatException catch (e) {
+      throw _CloudError(
+        'geçersiz model adı/adres (${SecretMask.redact(e.message)})',
+        _Kind.badRequest,
+        fixedCoolMs: 5 * 60 * 1000,
+      );
+    }
+    return pr == CloudProvider.gemini ? _geminiRequest(uri, cfg, p, maxTokens) : _openAiRequest(uri, pr, cfg, p, maxTokens);
   }
 
   Future<void> _call(
@@ -503,64 +820,111 @@ class CloudEngine implements LlmEngine {
     ChatMlParse p,
     int maxTokens,
   ) async {
-    final cfg = _config.providers[pr]!;
+    final cfg = _config.providers[pr];
+    if (cfg == null) throw _CloudError('sağlayıcı ayarı yok', _Kind.other, fixedCoolMs: 60 * 60 * 1000);
+    SecretMask.register(cfg.apiKey);
     await _pace(run, pr);
     if (run.cancelled) return;
-    final client = HttpClient()..connectionTimeout = const Duration(seconds: 30);
-    run.client = client;
-    try {
-      final req = pr == CloudProvider.gemini
-          ? await _geminiRequest(client, cfg, p, maxTokens)
-          : await _openAiRequest(client, pr, cfg, p, maxTokens);
-      final res = await req.close().timeout(const Duration(seconds: 120));
-      if (res.statusCode != 200) {
-        final body = await utf8.decoder.bind(res).join().timeout(const Duration(seconds: 20));
-        throw _errorFor(pr, res.statusCode, body, res.headers);
+    final req = _buildRequest(pr, cfg, p, maxTokens);
+    await _CloudHttp(_policy, run).post<void>(pr, req, onOk: (res) => _consume(run, c, pr, res));
+  }
+
+  /// SSE akışını okur ve metni [c]'ye iletir. Boş/bozuk yanıtı sınıflandırılmış hataya çevirir.
+  Future<void> _consume(_CloudRun run, StreamController<String> c, CloudProvider pr, HttpClientResponse res) async {
+    var visible = 0; // boşluk dışı karakter sayısı: yalnızca boşluktan oluşan yanıt "boş" sayılır
+    final nonSse = StringBuffer(); // SSE olmayan gövde (düz JSON hata/yanıt) tanılama ve kurtarma için
+    final watch = Stopwatch()..start();
+
+    var pendingWs = ''; // baştaki boşluklar, görünür metin gelene dek tutulur (boş yanıt temiz sayılsın)
+    void emit(String text) {
+      if (text.isEmpty) return;
+      final v = text.replaceAll(_wsRe, '').length;
+      if (visible == 0 && v == 0) {
+        if (pendingWs.length < 4096) pendingWs += text;
+        return;
       }
-      var emitted = 0;
-      final lines = res.transform(utf8.decoder).transform(const LineSplitter());
-      try {
-        await for (final line in lines.timeout(const Duration(seconds: 120))) {
-          if (run.cancelled) return;
-          final data = _sseData(line);
-          if (data == null) continue;
-          if (data == '[DONE]') break;
-          Object? j;
-          try {
-            j = jsonDecode(data);
-          } catch (_) {
-            continue; // bozuk/yarım satır
-          }
-          if (j is! Map) continue;
-          if (j['error'] != null) {
-            throw _errorFor(pr, _errCode(j['error']), jsonEncode(j), null, emitted: emitted);
-          }
-          final text = pr == CloudProvider.gemini ? _geminiText(j) : _openAiText(j);
-          if (text.isNotEmpty) {
-            emitted += text.length;
-            if (!run.cancelled) c.add(text);
-          } else if (pr == CloudProvider.gemini) {
-            final block = _geminiBlock(j);
-            if (block != null) throw _CloudError(block, 20000, emitted: emitted);
+      visible += v;
+      final out = pendingWs.isEmpty ? text : '$pendingWs$text';
+      pendingWs = '';
+      if (!run.cancelled && !c.isClosed) c.add(out);
+    }
+
+    try {
+      final lines = res.transform(const Utf8Decoder(allowMalformed: true)).transform(const LineSplitter());
+      await for (final line in lines.timeout(_policy.idleTimeout)) {
+        if (run.cancelled) return;
+        if (watch.elapsed > _policy.maxStreamDuration) {
+          throw _CloudError('akış çok uzun sürdü', _Kind.timeout, emitted: visible);
+        }
+        final data = _sseData(line);
+        if (data == null) {
+          if (nonSse.length < 8192 && line.trim().isNotEmpty && !line.startsWith(':')) nonSse.writeln(line);
+          continue;
+        }
+        if (data == '[DONE]') break;
+        Object? j;
+        try {
+          j = jsonDecode(data);
+        } catch (_) {
+          continue; // bozuk/yarım satır
+        }
+        if (j is! Map) continue;
+        if (j['error'] != null) {
+          throw CloudEngine._errorFor(pr, _errCode(j['error']), jsonEncode(j), null, emitted: visible);
+        }
+        final text = _textOf(pr, j);
+        if (text.isNotEmpty) {
+          emit(text);
+        } else if (pr == CloudProvider.gemini) {
+          final block = _geminiBlock(j);
+          if (block != null) {
+            throw _CloudError(block, _Kind.blocked, hintMs: 20000, emitted: visible);
           }
         }
-      } on TimeoutException {
-        throw _CloudError('akış zaman aşımı', 30000, emitted: emitted);
-      } on SocketException catch (e) {
-        if (run.cancelled) return;
-        throw _CloudError('bağlantı koptu (${e.message})', 30000, emitted: emitted);
-      } on HttpException catch (e) {
-        if (run.cancelled) return;
-        throw _CloudError('bağlantı koptu (${e.message})', 30000, emitted: emitted);
       }
-      if (emitted == 0) throw _CloudError('boş yanıt', 20000);
-    } finally {
-      run.client = null;
-      try {
-        client.close(force: true);
-      } catch (_) {}
+    } on TimeoutException {
+      throw _CloudError('akış zaman aşımı', _Kind.timeout, emitted: visible);
+    } on SocketException catch (e) {
+      if (run.cancelled) return;
+      throw _CloudError('bağlantı koptu (${SecretMask.redact(e.message)})', _Kind.network, emitted: visible);
+    } on HttpException catch (e) {
+      if (run.cancelled) return;
+      throw _CloudError('bağlantı koptu (${SecretMask.redact(e.message)})', _Kind.network, emitted: visible);
+    } on TlsException catch (e) {
+      if (run.cancelled) return;
+      throw _CloudError('TLS hatası (${SecretMask.redact(e.message)})', _Kind.network, emitted: visible);
+    }
+    if (run.cancelled) return;
+    if (visible == 0 && nonSse.isNotEmpty) {
+      // Sunucu SSE yerine düz JSON döndürmüş olabilir (hata gövdesi veya tek parça yanıt).
+      _recoverPlainJson(pr, nonSse.toString(), emit, visible);
+    }
+    if (visible == 0) {
+      final hint = nonSse.isEmpty ? '' : ' (${SecretMask.redact(_briefBody(nonSse.toString()))})';
+      throw _CloudError('boş yanıt$hint', _Kind.empty, hintMs: 20000);
     }
   }
+
+  /// Düz JSON gövdeden hata fırlatır veya metni [emit] ile iletir; tanınmazsa sessizce döner.
+  static void _recoverPlainJson(CloudProvider pr, String raw, void Function(String) emit, int emittedSoFar) {
+    Object? j;
+    try {
+      j = jsonDecode(raw.trim());
+    } catch (_) {
+      return;
+    }
+    final items = j is List ? j : <Object?>[j];
+    for (final it in items) {
+      if (it is! Map) continue;
+      if (it['error'] != null) {
+        throw CloudEngine._errorFor(pr, _errCode(it['error']), jsonEncode(it), null, emitted: emittedSoFar);
+      }
+      final t = _textOf(pr, it);
+      if (t.isNotEmpty) emit(t);
+    }
+  }
+
+  static String _textOf(CloudProvider pr, Map j) => pr == CloudProvider.gemini ? _geminiText(j) : _openAiText(j);
 
   static String? _sseData(String line) {
     if (!line.startsWith('data:')) return null; // yorum (": ...") ve boş satırlar
@@ -577,15 +941,7 @@ class CloudEngine implements LlmEngine {
     return 500;
   }
 
-  Future<HttpClientRequest> _geminiRequest(
-    HttpClient client,
-    CloudProviderConfig cfg,
-    ChatMlParse p,
-    int maxTokens,
-  ) async {
-    final uri = Uri.parse(
-      'https://generativelanguage.googleapis.com/v1beta/models/${cfg.model.trim()}:streamGenerateContent?alt=sse',
-    );
+  _CloudRequest _geminiRequest(Uri uri, CloudProviderConfig cfg, ChatMlParse p, int maxTokens) {
     final body = <String, dynamic>{
       'contents': [
         for (final t in p.turns)
@@ -609,21 +965,10 @@ class CloudEngine implements LlmEngine {
         ],
       };
     }
-    return _post(client, uri, {'x-goog-api-key': cfg.apiKey.trim()}, body);
+    return _CloudRequest(uri, {'x-goog-api-key': cfg.apiKey.trim()}, body);
   }
 
-  Future<HttpClientRequest> _openAiRequest(
-    HttpClient client,
-    CloudProvider pr,
-    CloudProviderConfig cfg,
-    ChatMlParse p,
-    int maxTokens,
-  ) async {
-    final uri = Uri.parse(
-      pr == CloudProvider.groq
-          ? 'https://api.groq.com/openai/v1/chat/completions'
-          : 'https://openrouter.ai/api/v1/chat/completions',
-    );
+  _CloudRequest _openAiRequest(Uri uri, CloudProvider pr, CloudProviderConfig cfg, ChatMlParse p, int maxTokens) {
     final body = <String, dynamic>{
       'model': cfg.model.trim(),
       'stream': true,
@@ -637,23 +982,7 @@ class CloudEngine implements LlmEngine {
     if (pr == CloudProvider.openrouter) {
       headers['X-Title'] = 'Kripton';
     }
-    return _post(client, uri, headers, body);
-  }
-
-  Future<HttpClientRequest> _post(
-    HttpClient client,
-    Uri uri,
-    Map<String, String> headers,
-    Map<String, dynamic> body,
-  ) async {
-    final req = await client.postUrl(uri).timeout(const Duration(seconds: 30));
-    req.headers.set(HttpHeaders.contentTypeHeader, 'application/json; charset=utf-8');
-    req.headers.set(HttpHeaders.acceptHeader, 'text/event-stream');
-    headers.forEach(req.headers.set);
-    final bytes = utf8.encode(jsonEncode(body));
-    req.contentLength = bytes.length;
-    req.add(bytes);
-    return req;
+    return _CloudRequest(uri, headers, body);
   }
 
   static String _geminiText(Map j) {
@@ -695,12 +1024,13 @@ class CloudEngine implements LlmEngine {
     final first = ch.first;
     if (first is! Map) return '';
     final delta = first['delta'];
-    if (delta is! Map) return '';
-    final t = delta['content'];
-    return t is String ? t : '';
+    if (delta is Map && delta['content'] is String) return delta['content'] as String;
+    final message = first['message']; // akışsız (düz JSON) yanıt
+    if (message is Map && message['content'] is String) return message['content'] as String;
+    return '';
   }
 
-  /// HTTP durum koduna göre sağlayıcıyı ne kadar süre dinlendireceğimizi belirler.
+  /// HTTP durum koduna göre hatayı sınıflandırır ve sağlayıcının ne kadar dinlendirileceğini belirler.
   static _CloudError _errorFor(
     CloudProvider pr,
     int status,
@@ -708,33 +1038,50 @@ class CloudEngine implements LlmEngine {
     HttpHeaders? headers, {
     int emitted = 0,
   }) {
-    var msg = _briefBody(body);
+    final brief = _briefBody(body);
     final lower = body.toLowerCase();
-    int cool;
+    String msg;
+    _Kind kind;
+    int? hint;
+    int? fixed;
     if (status == 429) {
       final daily = lower.contains('perday') || lower.contains('per day') || lower.contains('daily');
-      cool = daily ? 30 * 60 * 1000 : _retryAfterMs(body, headers) ?? 60 * 1000;
-      msg = 'kota/sınır (429): $msg';
+      kind = _Kind.rateLimit;
+      if (daily) {
+        fixed = 30 * 60 * 1000;
+      } else {
+        hint = _retryAfterMs(body, headers);
+      }
+      msg = 'kota/sınır (429): $brief';
     } else if (status == 401 || status == 403) {
-      cool = 6 * 60 * 60 * 1000;
-      msg = 'anahtar reddedildi ($status): $msg';
+      kind = _Kind.auth;
+      fixed = 6 * 60 * 60 * 1000;
+      msg = 'anahtar reddedildi ($status): $brief';
     } else if (status == 404) {
-      cool = 6 * 60 * 60 * 1000;
-      msg = 'model/uç nokta bulunamadı (404): model adını kontrol et. $msg';
+      kind = _Kind.notFound;
+      fixed = 6 * 60 * 60 * 1000;
+      msg = 'model/uç nokta bulunamadı (404): model adını kontrol et. $brief';
     } else if (status == 413) {
-      cool = 60 * 1000;
-      msg = 'istek çok büyük (413): $msg';
+      kind = _Kind.tooLarge;
+      fixed = 60 * 1000;
+      msg = 'istek çok büyük (413): $brief';
     } else if (status == 400) {
-      cool = 5 * 60 * 1000;
-      msg = 'geçersiz istek (400): $msg';
+      kind = _Kind.badRequest;
+      fixed = 5 * 60 * 1000;
+      msg = 'geçersiz istek (400): $brief';
+    } else if (status == 408) {
+      kind = _Kind.timeout;
+      msg = 'sunucu zaman aşımı (408): $brief';
     } else if (status >= 500) {
-      cool = 45 * 1000;
-      msg = 'sunucu hatası ($status): $msg';
+      kind = _Kind.server;
+      hint = _retryAfterMs(body, headers);
+      msg = 'sunucu hatası ($status): $brief';
     } else {
-      cool = 60 * 1000;
-      msg = 'HTTP $status: $msg';
+      kind = _Kind.other;
+      fixed = 60 * 1000;
+      msg = 'HTTP $status: $brief';
     }
-    return _CloudError(msg, cool, emitted: emitted);
+    return _CloudError(SecretMask.redact(msg), kind, hintMs: hint, fixedCoolMs: fixed, emitted: emitted);
   }
 
   static int? _retryAfterMs(String body, HttpHeaders? headers) {
@@ -774,79 +1121,112 @@ class CloudEngine implements LlmEngine {
 
 /// Otonom mod için araştırma: Gemini + Google Arama (yalnızca Gemini anahtarı varsa).
 /// Hiçbir koşulda istisna fırlatmaz; başarısızlıkta null döner ve oturum araştırmasız sürer.
-Future<String?> cloudResearch(String goal, {String projectHint = ''}) async {
-  final cfg = CloudConfig.instance;
-  if (!cfg.research) return null;
-  final g = cfg.providers[CloudProvider.gemini]!;
-  if (!g.usable) return null;
-  if ((CloudEngine._cool[CloudProvider.gemini] ?? 0) > DateTime.now().millisecondsSinceEpoch) return null;
-  final client = HttpClient()..connectionTimeout = const Duration(seconds: 30);
+/// Geçici hatalarda (429/5xx/ağ) üstel geri çekilmeyle [CloudRetryPolicy.researchAttempts] kez dener;
+/// [cancel] ile her an iptal edilebilir.
+Future<String?> cloudResearch(
+  String goal, {
+  String projectHint = '',
+  CloudCancelToken? cancel,
+  CloudRetryPolicy policy = const CloudRetryPolicy(),
+  CloudConfig? config,
+  Uri? endpoint,
+}) async {
+  final run = _CloudRun();
   try {
-    final uri = Uri.parse(
-      'https://generativelanguage.googleapis.com/v1beta/models/${g.model.trim()}:generateContent',
-    );
+    final cfg = config ?? CloudConfig.instance;
+    if (!cfg.research) return null;
+    final g = cfg.providers[CloudProvider.gemini];
+    if (g == null || !g.usable) return null;
+    if ((CloudEngine._cool[CloudProvider.gemini] ?? 0) > DateTime.now().millisecondsSinceEpoch) return null;
+    SecretMask.register(g.apiKey);
+    run.attach(cancel);
+
+    final uri = endpoint ??
+        Uri.parse('https://generativelanguage.googleapis.com/v1beta/models/${g.model.trim()}:generateContent');
     final prompt = 'Bir Flutter/Dart projesini şu hedef doğrultusunda geliştireceğiz:\n$goal\n\n'
         '${projectHint.isEmpty ? '' : 'Proje bağımlılıkları: $projectHint\n\n'}'
         'Web\'de ARAŞTIR ve Türkçe, madde madde, en çok 1800 karakterlik kısa bir not yaz: '
         '(1) bu hedef için güncel en iyi uygulama yaklaşımı, (2) kullanılabilecek güncel Flutter/Dart '
         'paketleri ve sık yapılan hatalar, (3) kaçınılması gereken kullanımdan kalkmış API\'ler. '
         'Kod yazma; yalnızca doğrulanmış bilgi ver, emin olmadığını belirt.';
-    final body = {
-      'contents': [
-        {
-          'role': 'user',
-          'parts': [
-            {'text': prompt},
-          ],
-        },
-      ],
-      'tools': [
-        {'google_search': <String, dynamic>{}},
-      ],
-      'generationConfig': {'maxOutputTokens': 4096, 'temperature': 0.2},
-    };
-    final req = await client.postUrl(uri).timeout(const Duration(seconds: 30));
-    req.headers.set(HttpHeaders.contentTypeHeader, 'application/json; charset=utf-8');
-    req.headers.set('x-goog-api-key', g.apiKey.trim());
-    final bytes = utf8.encode(jsonEncode(body));
-    req.contentLength = bytes.length;
-    req.add(bytes);
-    final res = await req.close().timeout(const Duration(seconds: 120));
-    final txt = await utf8.decoder.bind(res).join().timeout(const Duration(seconds: 120));
-    if (res.statusCode != 200) {
-      final e = CloudEngine._errorFor(CloudProvider.gemini, res.statusCode, txt, res.headers);
-      CloudEngine._cool[CloudProvider.gemini] = DateTime.now().millisecondsSinceEpoch + e.cooldownMs;
-      CrashGuard.log('Bulut araştırma', e.message, null);
-      return null;
-    }
-    final j = jsonDecode(txt);
-    if (j is! Map) return null;
-    final text = CloudEngine._geminiText(j).trim();
-    if (text.isEmpty) return null;
-    final sources = <String>[];
-    final cands = j['candidates'];
-    if (cands is List && cands.isNotEmpty && cands.first is Map) {
-      final gm = (cands.first as Map)['groundingMetadata'];
-      if (gm is Map && gm['groundingChunks'] is List) {
-        for (final ch in gm['groundingChunks'] as List) {
-          if (ch is Map && ch['web'] is Map) {
-            final title = (ch['web'] as Map)['title'];
-            if (title is String && title.isNotEmpty && !sources.contains(title) && sources.length < 5) {
-              sources.add(title);
-            }
-          }
+    final req = _CloudRequest(
+      uri,
+      {'x-goog-api-key': g.apiKey.trim()},
+      {
+        'contents': [
+          {
+            'role': 'user',
+            'parts': [
+              {'text': prompt},
+            ],
+          },
+        ],
+        'tools': [
+          {'google_search': <String, dynamic>{}},
+        ],
+        'generationConfig': {'maxOutputTokens': 4096, 'temperature': 0.2},
+      },
+    );
+
+    final attempts = policy.researchAttempts < 1 ? 1 : policy.researchAttempts;
+    for (var attempt = 1; attempt <= attempts; attempt++) {
+      if (run.cancelled) return null;
+      try {
+        final body = await _CloudHttp(policy, run).post<String>(
+          CloudProvider.gemini,
+          req,
+          onOk: (res) => _CloudHttp.readBody(res, policy.headersTimeout),
+        );
+        if (run.cancelled) return null;
+        CloudEngine._fails[CloudProvider.gemini] = 0;
+        return _researchText(body);
+      } catch (e, st) {
+        if (run.cancelled) return null;
+        final ce = CloudEngine._asCloudError(e);
+        CrashGuard.log('Bulut araştırma', ce.message, attempt == attempts ? st : null);
+        final transient = ce.fixedCoolMs == null;
+        if (!transient || attempt == attempts) {
+          // Kalıcı hata (anahtar/model) veya deneme hakkı bitti: sağlayıcıyı dinlendir, araştırmasız sürsün.
+          CloudEngine._cool[CloudProvider.gemini] = DateTime.now().millisecondsSinceEpoch +
+              (ce.fixedCoolMs ?? math.max(policy.minCooldownMs, ce.hintMs ?? 0));
+          return null;
         }
+        // Geçici hata: üstel geri çekilme (iptal edilebilir uyku), en çok 60 sn.
+        final waitMs = math.max(ce.hintMs ?? 0, policy.backoffMs(attempt, CloudEngine._rnd));
+        await run.sleep(math.min(waitMs, 60000));
       }
     }
-    final out = StringBuffer(text.length > 1600 ? text.substring(0, 1600) : text);
-    if (sources.isNotEmpty) out.write('\nKaynaklar: ${sources.join(', ')}');
-    return out.toString();
+    return null;
   } catch (e, st) {
     CrashGuard.log('Bulut araştırma', e.toString(), st);
     return null;
   } finally {
-    try {
-      client.close(force: true);
-    } catch (_) {}
+    run.dispose();
   }
+}
+
+/// Araştırma yanıtından (düz JSON) kısa not + kaynak başlıkları üretir; anlamsızsa null.
+String? _researchText(String body) {
+  final j = jsonDecode(body);
+  if (j is! Map) return null;
+  final text = CloudEngine._geminiText(j).trim();
+  if (text.isEmpty) return null;
+  final sources = <String>[];
+  final cands = j['candidates'];
+  if (cands is List && cands.isNotEmpty && cands.first is Map) {
+    final gm = (cands.first as Map)['groundingMetadata'];
+    if (gm is Map && gm['groundingChunks'] is List) {
+      for (final ch in gm['groundingChunks'] as List) {
+        if (ch is Map && ch['web'] is Map) {
+          final title = (ch['web'] as Map)['title'];
+          if (title is String && title.isNotEmpty && !sources.contains(title) && sources.length < 5) {
+            sources.add(title);
+          }
+        }
+      }
+    }
+  }
+  final out = StringBuffer(text.length > 1600 ? text.substring(0, 1600) : text);
+  if (sources.isNotEmpty) out.write('\nKaynaklar: ${sources.join(', ')}');
+  return out.toString();
 }

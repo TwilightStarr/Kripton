@@ -11,6 +11,7 @@ import '../data/file_service.dart';
 import '../data/flutter_project_check.dart' show ProjectProblem;
 import '../data/github_ci.dart';
 import '../data/cloud_engine.dart';
+import '../data/crash_guard.dart';
 import '../data/llm_engine.dart';
 import '../data/model_downloader.dart';
 import '../data/native_services.dart';
@@ -208,6 +209,11 @@ class AppState {
 class AppController extends Notifier<AppState> {
   Timer? _saveTimer;
   Timer? _flushTimer;
+  bool _disposed = false;
+  List<Workflow>? _pendingSave;
+
+  /// Bellekte tutulan en çok günlük satırı (sade modda [_liteLogKeep]); saatler süren oturumda şişmez.
+  static const _maxLogKeep = 3000;
   final StringBuffer _buf = StringBuffer();
   CancelToken? _cancel;
   final Set<String> _active = {};
@@ -223,17 +229,56 @@ class AppController extends Notifier<AppState> {
 
   @override
   AppState build() {
+    final storage = ref.read(storageProvider);
     ref.onDispose(() {
-      _tb?.end(cancelled: true);
+      _disposed = true;
+      try {
+        _tb?.end(cancelled: true);
+      } catch (_) {}
       _saveTimer?.cancel();
       _flushTimer?.cancel();
+      _flushTimer = null;
       _cancel?.cancel();
+      for (final d in _downloads.values) {
+        d.cancelled = true;
+      }
+      _buf.clear();
+      final pending = _pendingSave;
+      _pendingSave = null;
+      if (pending != null) {
+        // Bekleyen (debounce edilmiş) kayıt kaybolmasın.
+        unawaited(storage.saveWorkflows(pending).catchError((Object _) {}));
+      }
     });
     Future.microtask(_init);
     return const AppState();
   }
 
   Future<void> _init() async {
+    try {
+      await _initCore();
+    } catch (e, st) {
+      // Başlatma hatası arayüzü sonsuz yüklemede bırakmasın: varsayılan akışlarla açılır.
+      CrashGuard.log('Başlatma', e, st);
+      if (_disposed) return;
+      try {
+        final id = modelCatalog.first.id;
+        final wfs = defaultWorkflows(primaryId: id, reviewerId: id);
+        state = state.copyWith(
+          loaded: true,
+          workflows: wfs,
+          models: [...modelCatalog, ...cloudModels()],
+          currentId: wfs.first.id,
+          selectedAgentId: wfs.first.agents.isEmpty ? null : wfs.first.agents.first.id,
+        );
+        _notice('Kayıtlı veriler okunamadı; varsayılan akışlarla açıldı.');
+      } catch (e2, st2) {
+        CrashGuard.log('Başlatma (yedek yol)', e2, st2);
+      }
+    }
+  }
+
+  Future<void> _initCore() async {
     final st = ref.read(storageProvider);
     final reg = await st.loadRegistry();
     final models = modelCatalog.map((m) {
@@ -266,6 +311,7 @@ class AppController extends Notifier<AppState> {
         await st.saveWorkflows(wfs);
       }
     }
+    if (_disposed) return;
     state = state.copyWith(
       totalRamBytes: totalRam,
       defaultPick: pick,
@@ -279,14 +325,29 @@ class AppController extends Notifier<AppState> {
     );
   }
 
-  void _notice(String m) =>
-      state = state.copyWith(notice: m, noticeId: state.noticeId + 1);
+  void _notice(String m) {
+    if (_disposed) return;
+    state = state.copyWith(notice: m, noticeId: state.noticeId + 1);
+  }
 
   void _persist() {
+    if (_disposed) return;
+    _pendingSave = state.workflows;
     _saveTimer?.cancel();
     _saveTimer = Timer(const Duration(milliseconds: 500), () {
-      ref.read(storageProvider).saveWorkflows(state.workflows);
+      final list = _pendingSave;
+      _pendingSave = null;
+      if (_disposed || list == null) return;
+      unawaited(_saveWorkflows(list));
     });
+  }
+
+  Future<void> _saveWorkflows(List<Workflow> list) async {
+    try {
+      await ref.read(storageProvider).saveWorkflows(list);
+    } catch (e, st) {
+      CrashGuard.log('Akışlar kaydedilemedi', e, st);
+    }
   }
 
   void _mutateCurrent(Workflow Function(Workflow) f, {bool persist = true}) {
@@ -446,7 +507,7 @@ class AppController extends Notifier<AppState> {
         type: FileType.custom,
         allowedExtensions: const ['zip'],
       );
-      final path = res?.files.single.path;
+      final path = res?.files.firstOrNull?.path;
       if (path == null) return false;
       final dir = await ref.read(storageProvider).projectsDir();
       final saved = await ProjectSource.copyInto(dir, path);
@@ -537,10 +598,16 @@ class AppController extends Notifier<AppState> {
   }
 
   Future<void> attachFiles(String agentId) async {
-    final res = await FilePicker.platform.pickFiles(
-      allowMultiple: true,
-      withData: true,
-    );
+    FilePickerResult? res;
+    try {
+      res = await FilePicker.platform.pickFiles(
+        allowMultiple: true,
+        withData: true,
+      );
+    } catch (e) {
+      _notice('Dosya seçici açılamadı: $e');
+      return;
+    }
     if (res == null) return;
     final cur = state.current;
     if (cur == null) return;
@@ -574,8 +641,10 @@ class AppController extends Notifier<AppState> {
     _notice('${added.length} dosya eklendi.');
   }
 
-  void _setProgress(String id, double v) =>
-      state = state.copyWith(downloads: {...state.downloads, id: v});
+  void _setProgress(String id, double v) {
+    if (_disposed) return;
+    state = state.copyWith(downloads: {...state.downloads, id: v});
+  }
 
   Future<void> startDownload(String id) async {
     if (state.downloads.containsKey(id)) return;
@@ -618,8 +687,10 @@ class AppController extends Notifier<AppState> {
       _notice('İndirme hatası: $e');
     } finally {
       _downloads.remove(id);
-      final d = {...state.downloads}..remove(id);
-      state = state.copyWith(downloads: d);
+      if (!_disposed) {
+        final d = {...state.downloads}..remove(id);
+        state = state.copyWith(downloads: d);
+      }
     }
   }
 
@@ -681,6 +752,10 @@ class AppController extends Notifier<AppState> {
   }
 
   void _flush() {
+    if (_disposed) {
+      _buf.clear();
+      return;
+    }
     if (state.lite) {
       _buf.clear();
       return;
@@ -718,12 +793,15 @@ class AppController extends Notifier<AppState> {
     return '${two(t.hour)}:${two(t.minute)}:${two(t.second)}';
   }
 
-  void _addLog(String who, String msg, LogType type) => state = state.copyWith(
-    logs: [
+  void _addLog(String who, String msg, LogType type) {
+    if (_disposed) return;
+    final all = [
       ...state.logs,
       ExecutionLog(time: _now(), agentName: who, message: msg, type: type),
-    ],
-  );
+    ];
+    final keep = state.lite ? _liteLogKeep : _maxLogKeep;
+    state = state.copyWith(logs: all.length > keep ? all.sublist(all.length - keep) : all);
+  }
 
   /// Çalışan (running/looping) düğümleri izler; iptalde idle, hatada error'a çevrilir.
   void _trackAgent(String id, AgentStatus s, int loop) {
@@ -758,10 +836,9 @@ class AppController extends Notifier<AppState> {
     log: (l) {
       if (!ct.cancelled) {
         final all = [...state.logs, l];
+        final keep = state.lite ? _liteLogKeep : _maxLogKeep;
         state = state.copyWith(
-          logs: state.lite && all.length > _liteLogKeep
-              ? all.sublist(all.length - _liteLogKeep)
-              : all,
+          logs: all.length > keep ? all.sublist(all.length - keep) : all,
         );
         _bridge.onLog(l);
       }
@@ -861,16 +938,16 @@ class AppController extends Notifier<AppState> {
       const Duration(milliseconds: 40),
       (_) => _flush(),
     );
-    _bridge.begin(wf, state.models);
-    await _wakelock(true); // üretim boyunca (finally'ye kadar) aktif
-    DeviceThermal.charging().then((c) {
-      if (c == false && wf.agents.length >= 3 && state.running) {
-        _notice(
-          'İpucu: uzun iş akışlarını şarjdayken çalıştır; ısınma ve yavaşlama azalır.',
-        );
-      }
-    });
     try {
+      _bridge.begin(wf, state.models);
+      await _wakelock(true); // üretim boyunca (finally'ye kadar) aktif
+      DeviceThermal.charging().then((c) {
+        if (!_disposed && c == false && wf.agents.length >= 3 && state.running) {
+          _notice(
+            'İpucu: uzun iş akışlarını şarjdayken çalıştır; ısınma ve yavaşlama azalır.',
+          );
+        }
+      }).catchError((Object _) {});
       final art = await ref
           .read(runnerProvider)
           .run(
@@ -927,16 +1004,21 @@ class AppController extends Notifier<AppState> {
         _addLog('Sistem', '$e', LogType.error);
       }
     } finally {
-      _flush();
+      // Her adım ayrı korunur: biri patlasa bile "running" takılı kalmaz.
+      try {
+        _flush();
+      } catch (_) {}
       _flushTimer?.cancel();
       _flushTimer = null;
       _buf.clear();
       _cancel = null;
       _active.clear();
-      _bridge.end(failed: state.failed, cancelled: ct.cancelled);
-      _bridge.lite = false;
+      try {
+        _bridge.end(failed: state.failed, cancelled: ct.cancelled);
+        _bridge.lite = false;
+      } catch (_) {}
       await _wakelock(false);
-      state = state.copyWith(running: false, cancelling: false, lite: false);
+      if (!_disposed) state = state.copyWith(running: false, cancelling: false, lite: false);
     }
   }
 
@@ -1087,9 +1169,10 @@ class AppController extends Notifier<AppState> {
     );
     _flushTimer?.cancel();
     _flushTimer = Timer.periodic(const Duration(milliseconds: 40), (_) => _flush());
-    _bridge.begin(devWf, state.models);
-    await _wakelock(true);
-    if (auto) await NativeKeepAlive.acquire(); // 24 saatlik oturum boyunca ön plan servisi
+    var keepAliveHeld = false;
+    // Araştırma, oturum iptal edilince hemen kesilir (tek dinleyici; döngüde birikmez).
+    final researchCancel = CloudCancelToken();
+    unawaited(ct.onCancel.then((_) => researchCancel.cancel()));
 
     final runner = ref.read(runnerProvider);
     final cb = _callbacks(ct);
@@ -1124,7 +1207,7 @@ class AppController extends Notifier<AppState> {
       if (!auto || goal.isEmpty) return;
       _devSet((d) => d.copyWith(phase: 'Web araştırması yapılıyor'));
       _addLog('Sistem', 'Hedef için web araştırması yapılıyor (Gemini + Google Arama)…', LogType.info);
-      final notes = await cloudResearch(goal);
+      final notes = await cloudResearch(goal, cancel: researchCancel);
       if (notes == null) {
         _addLog(
           'Sistem',
@@ -1327,6 +1410,12 @@ class AppController extends Notifier<AppState> {
     }
 
     try {
+      _bridge.begin(devWf, state.models);
+      await _wakelock(true);
+      if (auto) {
+        await NativeKeepAlive.acquire(); // 24 saatlik oturum boyunca ön plan servisi
+        keepAliveHeld = true;
+      }
       if (improving) await researchGoal();
       final startRound = auto && cfg.resumeRound > 0 ? cfg.resumeRound + 1 : 1;
       for (var r = startRound; r <= stepLimit; r++) {
@@ -1478,6 +1567,7 @@ class AppController extends Notifier<AppState> {
             // Yerel (kesin) denetim: model kaçırsa bile derleme/çalışmayı bozan sorunlar 2. AI'ya gider.
             final fresh = <ProjectProblem>[];
             for (final pr in AutopilotChecks.problemsFor(snap, plan.paths)) {
+              if (detSeen.length > 5000) detSeen.clear(); // 24 saatlik oturumda harita şişmesin
               final key = '${pr.path}|${pr.message}';
               final seen = (detSeen[key] ?? 0) + 1;
               detSeen[key] = seen;
@@ -1773,23 +1863,30 @@ class AppController extends Notifier<AppState> {
         _addLog('Sistem', '$e', LogType.error);
       }
     } finally {
-      _flush();
+      try {
+        _flush();
+      } catch (_) {}
       _flushTimer?.cancel();
       _flushTimer = null;
       _buf.clear();
       _cancel = null;
       _active.clear();
-      _bridge.end(failed: state.failed, cancelled: ct.cancelled);
+      researchCancel.cancel();
+      try {
+        _bridge.end(failed: state.failed, cancelled: ct.cancelled);
+      } catch (_) {}
       await _wakelock(false);
-      if (auto) {
-        await NativeKeepAlive.release();
-        if (clearCheckpoint) {
-          try {
-            await ref.read(storageProvider).deleteJson(kAutopilotFile);
-          } catch (_) {}
-        }
+      if (keepAliveHeld) {
+        try {
+          await NativeKeepAlive.release();
+        } catch (_) {}
       }
-      state = state.copyWith(running: false, cancelling: false);
+      if (auto && clearCheckpoint) {
+        try {
+          await ref.read(storageProvider).deleteJson(kAutopilotFile);
+        } catch (_) {}
+      }
+      if (!_disposed) state = state.copyWith(running: false, cancelling: false);
     }
   }
 
@@ -1835,7 +1932,7 @@ class AppController extends Notifier<AppState> {
       state = state.copyWith(status: '$reason — ${autopilotDurationText(left)} sonra yeniden denenecek');
       _devSet((x) => x.copyWith(phase: 'Bekleniyor: $reason'));
       final tick = left < const Duration(seconds: 2) ? left : const Duration(seconds: 2);
-      await Future.any<void>([Future<void>.delayed(tick), ct.onCancel]);
+      await ct.wait(tick);
     }
     if (ct.cancelled) throw const CancelledException();
   }
@@ -1928,7 +2025,13 @@ class AppController extends Notifier<AppState> {
     ),
   );
 
-  Future<void> discardAutopilot() => ref.read(storageProvider).deleteJson(kAutopilotFile);
+  Future<void> discardAutopilot() async {
+    try {
+      await ref.read(storageProvider).deleteJson(kAutopilotFile);
+    } catch (e, st) {
+      CrashGuard.log('Otonom kontrol noktası silinemedi', e, st);
+    }
+  }
 
   /// Seçilen ZIP akış paketini (workflow.json + prompts/configs) yeni bir akış olarak ekler.
   Future<void> importWorkflowZip(String path) async {
@@ -1944,7 +2047,7 @@ class AppController extends Notifier<AppState> {
       state = state.copyWith(
         workflows: [wf, ...state.workflows],
         currentId: wf.id,
-        selectedAgentId: wf.agents.first.id,
+        selectedAgentId: wf.agents.isEmpty ? null : wf.agents.first.id,
       );
       _persist();
       _notice('Akış yüklendi: ${wf.title} (${wf.agents.length} adım)');
@@ -1958,11 +2061,17 @@ class AppController extends Notifier<AppState> {
   /// Dosya seçiciyle .zip seçtirir ve [importWorkflowZip] ile içe aktarır.
   Future<void> pickAndImportWorkflowZip() async {
     if (state.running || state.cancelling) return;
-    final res = await FilePicker.platform.pickFiles(
-      type: FileType.custom,
-      allowedExtensions: const ['zip'],
-    );
-    final path = res?.files.single.path;
+    FilePickerResult? res;
+    try {
+      res = await FilePicker.platform.pickFiles(
+        type: FileType.custom,
+        allowedExtensions: const ['zip'],
+      );
+    } catch (e) {
+      _notice('Dosya seçici açılamadı: $e');
+      return;
+    }
+    final path = res?.files.firstOrNull?.path;
     if (path == null) return;
     await importWorkflowZip(path);
   }
@@ -2026,6 +2135,7 @@ class AppController extends Notifier<AppState> {
   }
 
   void _onCancelled() {
+    if (_disposed) return;
     for (final id in _active) {
       _setAgentState(id, AgentStatus.idle, 0);
     }

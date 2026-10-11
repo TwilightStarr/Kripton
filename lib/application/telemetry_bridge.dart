@@ -14,7 +14,6 @@ class TelemetryBridge {
 
   final TelemetryService service;
 
-  static const int _maxLogs = 200;
   static const int _maxStream = 8000;
 
   List<StepExecutionState> _steps = [];
@@ -23,7 +22,6 @@ class TelemetryBridge {
   final List<LiveLogEntry> _logs = [];
   final StringBuffer _stream = StringBuffer();
   String _activeId = '';
-  int _logSeq = 0;
 
   int _tokensTotal = 0;
   int _winTokens = 0;
