@@ -202,6 +202,8 @@ Doğrudan APK üretmek için:
 - Önce ARMv8.2 + dotprod/i8mm/fp16 bayraklı hızlı derlemeyi dener; derleme veya statik komut denetimi (SVE/SME/bf16
   yok mu) başarısız olursa güvenli varsayılan derlemeye döner.
 - APK ve SHA-256 dosyasını artifact olarak yükler ve GitHub Release olarak yayınlar.
+- Action'lar Node 24 sürümlerindedir (checkout@v6, setup-java@v5, upload-artifact@v6, action-gh-release@v3); runner `ubuntu-24.04`'e sabitlidir.
+- i8mm/dotprod komut denetimi yalnızca `libggml-cpu.so` için uyarı üretir (diğer .so'larda bu komutların bulunmaması normaldir).
 
 ---
 

@@ -512,10 +512,10 @@ on:
 
 jobs:
   build:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-java@v4
+      - uses: actions/checkout@v6
+      - uses: actions/setup-java@v5
         with:
           distribution: temurin
           java-version: 17
@@ -525,7 +525,7 @@ jobs:
       - run: bash kurulum.sh
       - run: flutter test
       - run: flutter build apk --release
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v6
         with:
           name: apk
           path: build/app/outputs/flutter-apk/app-release.apk

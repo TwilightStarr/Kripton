@@ -21,7 +21,7 @@ env:
 
 jobs:
   build:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 60
 
     steps:
@@ -37,7 +37,7 @@ jobs:
           df -h /
 
       - name: Kodu çek
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Kendi kaynak paketini hazırla (Kripton kendini geliştirebilsin)
         shell: bash
@@ -59,7 +59,7 @@ jobs:
           echo "Sürüm: ${VER_NAME}  Etiket: ${TAG}"
 
       - name: Java 17 kur
-        uses: actions/setup-java@v4
+        uses: actions/setup-java@v5
         with:
           distribution: temurin
           java-version: '17'
@@ -455,10 +455,10 @@ jobs:
           if [ -n "$PLUGIN" ]; then
             SINK_HITS=$(grep -rn "NO_EVENT_SINK" "$PLUGIN/android/src" 2>/dev/null | head -5 || true)
             if [ -n "$SINK_HITS" ]; then
-              echo "::warning::flutter_llama native kodunda NO_EVENT_SINK dönüşü var (Dart tarafı geri-düşme ile telafi eder):"
+              echo "::notice::flutter_llama native kodunda NO_EVENT_SINK dönüşü var (beklenen; Dart tarafı geri-düşme ile telafi eder):"
               echo "$SINK_HITS"
             else
-              echo "::warning::flutter_llama android kaynağında NO_EVENT_SINK bulunamadı; native yama gerekmiyor/uygulanamadı."
+              echo "::notice::flutter_llama android kaynağında NO_EVENT_SINK bulunamadı; native yama gerekmiyor."
             fi
           fi
           # Tüm Android alt projelerini (eklentiler) compileSdk 36 ile derle:
@@ -485,19 +485,35 @@ jobs:
           # SIGILL ön denetimi (x86 runner'da arm64 çalıştırılamaz => statik): .so içinde SVE/SME/bf16 komutu olmamalı.
           # Ayrıca smmla/usmmla/sdot sayısı bayrakların gerçekten etkili olduğunu gösterir (0 ise uyarı).
           sigill_check() {
-            local OD="$NDK_BIN/llvm-objdump" bad=0 seen=0 f n
+            local OD="$NDK_BIN/llvm-objdump" bad=0 seen=0 f n m total_dot=0 cpu_seen=0 base
             [ -x "$OD" ] || { echo "::warning::llvm-objdump yok; SIGILL denetimi atlandı"; return 0; }
+            # Aynı .so build/ ve android/ altında birden çok yolda görünebilir: dosya adına göre tekille
+            local LIST; LIST=$(find build android -path '*arm64-v8a*' -name '*.so' \( -name '*llama*' -o -name '*ggml*' \) 2>/dev/null | sort -u \
+              | awk -F/ '!s[$NF]++')
             while IFS= read -r f; do
+              [ -n "$f" ] || continue
+              base=$(basename "$f")
               n=$("$OD" -d --no-show-raw-insn --mattr=+v9.2a,+sve,+sve2,+sme,+bf16,+i8mm,+dotprod,+fullfp16 "$f" 2>/dev/null \
                 | grep -cE '\bz[0-9]+\.[bhsd]\b|\bp[0-9]+/[mz]\b|\bsmstart\b|\bsmstop\b|\bbfmmla\b|\bbfdot\b|\bbfmlal[bt]\b' || true)
               seen=$((seen+1))
-              echo "SIGILL denetimi: $(basename "$f") SVE/SME/bf16 komut sayısı=$n"
+              echo "SIGILL denetimi: $base SVE/SME/bf16 komut sayısı=$n"
               [ "${n:-0}" -eq 0 ] || bad=1
-              local m
               m=$("$OD" -d --no-show-raw-insn --mattr=+v9.2a,+i8mm,+dotprod,+fullfp16 "$f" 2>/dev/null | grep -cE '\b(smmla|usmmla|sdot|udot)\b' || true)
               echo "  i8mm/dotprod komut sayısı=$m"
-              [ "${m:-0}" -gt 0 ] || echo "::warning::$(basename "$f"): i8mm/dotprod komutu yok; -march bayrağı etkisiz olabilir"
-            done < <(find build android -path '*arm64-v8a*' -name '*.so' \( -name '*llama*' -o -name '*ggml*' \) 2>/dev/null | sort -u)
+              total_dot=$((total_dot + ${m:-0}))
+              # i8mm/dotprod çekirdekleri yalnızca ggml'in CPU backend kütüphanesinde bulunur;
+              # libllama/libggml/libggml-base/köprü kütüphanesinde 0 olması NORMALDİR (uyarı verme).
+              case "$base" in
+                *ggml-cpu*)
+                  cpu_seen=$((cpu_seen+1))
+                  [ "${m:-0}" -gt 0 ] || echo "::warning::$base: i8mm/dotprod komutu yok; -march bayrağı etkisiz olabilir"
+                  ;;
+              esac
+            done <<< "$LIST"
+            # libggml-cpu.so ayrı değilse (statik bağlı) çekirdekler başka bir .so'da olabilir: toplamı denetle
+            if [ "$cpu_seen" -eq 0 ] && [ "$seen" -gt 0 ] && [ "$total_dot" -eq 0 ]; then
+              echo "::warning::Hiçbir llama/ggml .so dosyasında i8mm/dotprod komutu yok; -march bayrağı etkisiz olabilir"
+            fi
             [ "$seen" -gt 0 ] || echo "::warning::SIGILL denetimi: llama/ggml .so bulunamadı"
             return $bad
           }
@@ -563,14 +579,14 @@ jobs:
           echo "APK_PATH=${APK}" >> "$GITHUB_ENV"
 
       - name: Artifact olarak yükle
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: Kripton-${{ env.TAG }}
           path: dist/*
           retention-days: 14
 
       - name: GitHub Release yayınla
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{ env.TAG }}
           target_commitish: ${{ github.sha }}

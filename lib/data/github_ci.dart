@@ -375,11 +375,11 @@ env:
   KRIPTON_BUILD: '__BUILD__'
 jobs:
   check:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 60
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-java@v4
+      - uses: actions/checkout@v6
+      - uses: actions/setup-java@v5
         with:
           distribution: temurin
           java-version: '17'
