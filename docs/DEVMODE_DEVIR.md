@@ -3,7 +3,7 @@
 ## GÖREV 1/10: Güvenli sır depolama
 
 ### Yapılanlar
-- `flutter_secure_storage` 11.2.0 (sabit) eklendi; pubspec SDK alt sınırı 3.8'e çıkarıldı (paketin gereği).
+- `flutter_secure_storage` 10.3.4 (sabit) eklendi. 11.x denendi: `file_picker ^8` ile win32 çakışması (CI `pub get` hatası) nedeniyle 10.3.4'e düşüldü; SDK alt sınırı 3.5 kaldı.
 - `lib/data/secret_store.dart` (YENİ): `SecretStore`, `SecureSecretStore`, `MemorySecretStore`, `SecretVault`, `SecretKeys`, `SecretStoreUnavailable`, `purgeSecretFileCopies`.
 - `CloudConfig` ve `GithubCiConfig`: anahtar/token artık JSON'a yazılmaz; yükleme sırasında eski düz metin güvenli depoya taşınır (yaz → geri oku → doğrula → JSON'u sırsız yeniden yaz → `.bak/.tmp/.corrupt` sil). Doğrulama başarısızsa eski JSON'a dokunulmaz, sır bellekte kalır.
 - Güvenli depo yoksa sır düz metne yazılmaz; yalnızca oturum belleğinde tutulur ve `SecretStoreUnavailable` döner.
@@ -41,9 +41,9 @@ SecretMask.exportKnown() -> List<String>; SecretMask.registerAll(Iterable<String
 
 ### DOĞRULANAMADI
 - `dart format`, `flutter analyze`, `flutter test` ÇALIŞTIRILAMADI (ortamda Flutter/Dart SDK yok, indirme engelli). Yazılan kod ve testler derlenmedi/çalıştırılmadı.
-- flutter_secure_storage 11.2.0'ın `AndroidOptions()` / `FlutterSecureStorage(aOptions:)` imzası pub.dev değişiklik günlüğü ve kaynak dosyasından okundu; derlemeyle doğrulanmadı. 11.x'te `encryptedSharedPreferences` yoktur; varsayılan AES-GCM + Keystore'da sarılmış anahtar kullanılır.
+- `AndroidOptions()` / `FlutterSecureStorage(aOptions:)` kullanımı 10.3.4 ile derlemeyle doğrulanmadı. 10.x'te `encryptedSharedPreferences` kullanımdan kalktı; varsayılan AES-GCM + Keystore'da sarılmış anahtar.
 - Manifest birleştirmede paketin kendi manifestiyle `allowBackup` çakışması olup olmadığı (çakışırsa `tools:replace="android:allowBackup"` gerekir).
-- Hedef Flutter sürümünün Dart ≥ 3.8 olduğu (CI `channel: stable`); `flutter_litert_lm: any` ile sürüm çözümlemesi.
+- `pub get` 10.3.4 ile çözülür mü (pub'ın önerisine dayanıyor, çalıştırılmadı).
 - `SecureSecretStore` testi, platform kanalı yokken istisna sızdırmadığını varsayar (`TestWidgetsFlutterBinding`).
 
 ### Bilinen riskler
