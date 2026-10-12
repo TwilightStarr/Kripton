@@ -221,3 +221,63 @@ DevPatcher.apply(..., onReject: (path, gate, detail) {}); DevPatcher.gateOfReaso
 - G5 yeni hata saptaması `FlutterProjectKit.check` ile sınırlıdır (tür/ad çözümlemesi yok); gerçek doğrulama CI'dır (`C1`).
 - Doğrulayıcı kendisi de bir model: prompt-injection riskine karşı diff "veri" olarak tanımlandı ve ONAY katıdır, ama garanti değildir.
 - Defter dosyası yazma hatalarında sessizce `writeFailures` sayar; `Storage` dizin yolunu vermediği için çağıran `Directory` seçmelidir (öneri: `<belgeler>/devlogs`).
+
+
+## GÖREV 5/19: Model havuzu (otomatik seçim) ve oturum olay deposu
+
+### Yapılanlar
+- `lib/application/dev_model_pool.dart` (YENİ): `DevModelPool` — anahtarı olan sağlayıcılarda keşif (`CloudModelService.fetchModels`), yalnızca ücretsiz adaylar (OpenRouter `:free`; Gemini/Groq anahtarın ücretsiz katmanı), sezgisel ön sıralama + kısa sağlık testi (sağlayıcı başına en çok `testsPerProvider`, `healthyTarget` sağlıklıda durur), son-bilinen-iyi önbellek (AtomicFile JSON, sır yok, TTL 6 sa). Roller: analist = bağlam+güç, düzeltici = kod sezgisi (coder/code/flash...), doğrulayıcı = düzelticiden farklı sağlayıcı tercihi. Durum makinesi: cooldown (Retry-After/retryDelay), günlük kota parkı (sıfırlanma saatine kadar; OpenRouter hesap geneli), devre kesici (kapalı/açık/yarı-açık, tek deneme, üstel açık süre), auth → sağlayıcı bloğu, 404 → ölü. Hepsi parktaysa `PoolPick.wait` + EN KISA bekleme. `ModelTrust` (Görev 4) puanı ve `demoted` sıralamaya girer.
+- `lib/application/dev_session_store.dart` (YENİ): `DevSessionStore` — `dev_sessions/{id}/events.jsonl` (toplu yazma, boyut sınırlı döndürme `.1..N`, yarım satır kurtarma, kalp atışı seyreltme), `session.json` (kontrol noktası), `changes.json` (dosya → durum/sha/ilk-son içerik özeti; tam içerik saklanmaz). Her metin `SecretMask.redact`'ten geçer.
+- `lib/data/cloud_models.dart` (yalnızca EKLEME, geriye uyumlu): `CloudModelTestResult.retryAfter/dailyQuota`, `parseCloudRetryAfter`, `isDailyQuotaBody`; `_Reply.retryAfterHeader`.
+- Testler: `test/dev_model_pool_test.dart`, `test/dev_session_store_test.dart` (YENİ). Python'da elle benzetim: tam havuzda roller (gemini pro / groq coder / openrouter 70b) ayrı ve farklı sağlayıcı; tek sağlayıcıda 3 farklı model; tek modelde aynı model + uyarı.
+
+### Public API
+```dart
+// dev_model_pool.dart
+String poolModelId(CloudProvider p, String model);  // 'groq:llama-...' ; VerifierPolicy.providerOf ile uyumlu
+CloudProvider? poolProviderOf(String id); String poolModelNameOf(String id); bool isFreeCandidate(CloudProvider, String);
+class ModelHeuristics { static strength(model,{label}); codeAffinity; contextScore(int?); paramsBillions }
+class PoolModel { provider, model, label, contextTokens; String get id }
+class DevPoolPolicy { failureThreshold=3, breakerOpenBase=2dk, breakerOpenMax=30dk, probeTimeout=3dk, transientCooldown=20sn, softCooldown=30sn, rateLimitDefault=60sn, rateLimitMax=15dk, minQuotaPark=5dk, authBlock=2sa, notFoundBlock=6sa, failedTestCooldown=5dk, testsPerProvider=6, healthyTarget=3, cacheTtl=6sa, maxCandidatesPerProvider=40 }
+enum PoolOutcomeKind { success, rateLimit, dailyQuota, server, network, timeout, auth, notFound, badRequest, tooLarge, blocked, empty, badOutput, other }
+class PoolReport { PoolReport({modelId, kind, retryAfter, message}); PoolReport.success(id); PoolReport.fromHttp({modelId,status,body,retryAfterHeader,now}); PoolReport.fromError(id, e) }
+enum PoolPickStatus { ok, wait, none }
+class PoolPick { status; PoolModel? model; Duration? waitFor; String reason; bool needsAttention; List<String> warnings; bool get ok }
+class RoleAssignment { analyst, fixer, verifier (PoolPick); warnings; complete; singleModel }
+class DevModelPool {
+  DevModelPool({required CloudModelService service, required CloudConfig config, DevPoolPolicy policy, ModelTrust? trust, File? cacheFile, PoolLog? log, now, sleep, random, retry});
+  Future<void> load(); Future<PoolDiscovery> discover({bool force=false});
+  PoolPick pick(String role /*DevRole.**/, {Set<String> exclude, String? differFrom});
+  RoleAssignment assign({Set<String> exclude}); bool report(PoolReport);
+  List<PoolModelStatus> snapshot(); bool get hasUsable; void invalidateProvider(CloudProvider);
+  static DateTime quotaResetAt(CloudProvider, DateTime now);
+}
+// dev_session_store.dart
+enum DevEventLevel { bilgi, uyari, hata }; enum DevEventKind { asama, analiz, yama, commit, ci, geriAlma, bekleme, kalpAtisi, durum }
+class DevEvent { DevEvent({ts, level, kind, message, files, sha, runUrl, modelId}); toJson(); static tryParse }
+enum DevSessionStatus { hazir, calisiyor, bekliyor, duraklatildi, tamamlandi, hata, iptal }
+class DevSessionState { id, status, repo, branch, baseBranch, headSha, startedAt, updatedAt, counters, blockedFiles, lastSignatures, models, phase, note; copyWith; incremented(name,[by]) }
+enum DevChangeStatus { eklendi, degistirildi, silindi, geriAlindi }; class DevContentDigest; class DevChange; class DevSessionInfo
+class DevSessionStore {
+  DevSessionStore({required Directory baseDir, required String sessionId, maxEventBytes=256KB, rotatedKeep=3, flushInterval=500ms, maxBatch=50, maxChangeEntries=2000, heartbeatMinGap=60sn, now});
+  Stream<DevEvent> get events; void append(DevEvent); void log(kind, message,{level,files,sha,runUrl,modelId}); Future<void> flush();
+  Future<List<DevEvent>> tail(int n); Future<DevSessionState?> loadSession(); Future<bool> saveCheckpoint(DevSessionState);
+  Future<List<DevSessionInfo>> listSessions({int limit=50}); Future<Map<String,DevChange>> loadChanges();
+  Future<bool> recordChange(path,{status, commitSha='', content}); Future<void> close(); static String sanitizeId(String);
+}
+```
+- Kullanım: orkestratör `assign()` → her istekte `pick(role, exclude, differFrom: fixerId)`; sonuç `report(...)`. `wait` → `waitFor` kadar bekle (başarısız sayma). Güveni `DevLedger` günceller (havuz güncellemez); `DevLedger.record*` çağrılarında `modelId` olarak havuz kimliğini (`provider:model`) kullan.
+
+### DOĞRULANAMADI
+- `dart format`, `flutter analyze`, `flutter test` ÇALIŞTIRILAMADI (SDK yok, ağ kapalı). Kod ve testler DERLENMEDİ/ÇALIŞTIRILMADI; yalnızca elle ve Python benzetimiyle gözden geçirildi.
+- Gerçek sağlayıcı davranışı: Gemini/Groq ücretsiz katman erişimi, kota sıfırlanma saatleri (Gemini 07:00 UTC en erken varsayım), OpenRouter `X-RateLimit-Reset` biçimi, `cloud_models` genişletmesinin gerçek `HttpClient` başlıklarıyla çalışması (sahte istemci başlık okuyamazsa yutulur).
+- Record desenleri (`final (a, b) = ...`) SDK ≥3.0 gerektirir; pubspec alt sınırı 3.5.
+
+### Bilinen riskler
+- Model adı sezgileri (`gemma`, `compound`, `vl` ... zayıf uyum; `lite/mini` küçük) yanılabilir; adlar koda gömülü değil ama kalıplar var.
+- `CloudEngine` hata sınıflandırması özel (`_Kind`); havuz kendi `PoolReport.fromHttp` kopyasını kullanır. Engine değişirse eşitle. Engine belirli (sağlayıcı, model) çiftini zorlayamıyor: orkestratör bağlantısı sonraki görev.
+- Tek sağlayıcıda doğrulayıcı zayıf model olabilir (rol çakışmaması güçten önceliklidir).
+- Yarı-açık deneme sonucu raporlanmazsa `probeTimeout` sonrası yeniden deneme verilir.
+- Olay günlüğü AtomicFile değil, JSONL ekleme + döndürmedir (AtomicFile yalnız JSON dosyalarına uygundur); `session.json`/`changes.json` AtomicFile.
+- Başarısız `recordChange` yazımında bellekteki harita diskten ileride kalabilir.
+- `cloud_models_test.dart` yeni `retryAfter` alanı için genişletilmedi (kapsam dışı).

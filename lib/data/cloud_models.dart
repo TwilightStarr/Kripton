@@ -64,12 +64,20 @@ class CloudModelTestResult {
     required this.message,
     this.statusCode,
     this.latencyMs,
+    this.retryAfter,
+    this.dailyQuota = false,
   });
 
   final CloudCheckKind kind;
   final String message;
   final int? statusCode;
   final int? latencyMs;
+
+  /// Görev 5: sunucunun bildirdiği bekleme (Retry-After / retryDelay / "try again in"); yoksa null.
+  final Duration? retryAfter;
+
+  /// Görev 5: 429 yanıtı günlük kotanın bittiğini gösteriyorsa true.
+  final bool dailyQuota;
 
   bool get ok => kind == CloudCheckKind.ok;
 }
@@ -92,10 +100,40 @@ class _CheckFailure implements Exception {
 }
 
 class _Reply {
-  const _Reply(this.status, this.body);
+  const _Reply(this.status, this.body, {this.retryAfterHeader});
 
   final int status;
   final String body;
+  final String? retryAfterHeader;
+}
+
+/// Görev 5: 429/5xx yanıtındaki bekleme süresini çıkarır: `Retry-After` başlığı (saniye), Gemini
+/// `"retryDelay": "34s"`, Groq `try again in 1m3.2s`. Bulunamazsa null; sonuç 1 sn..15 dk aralığına çekilir.
+Duration? parseCloudRetryAfter(String body, {String? header}) {
+  const lo = 1000;
+  const hi = 15 * 60 * 1000;
+  Duration? ms(double seconds) => Duration(milliseconds: (seconds * 1000).ceil().clamp(lo, hi));
+  final h = header == null ? null : double.tryParse(header.trim());
+  if (h != null && h >= 0) return ms(h);
+  final m = RegExp(r'"retryDelay"\s*:\s*"(\d+(?:\.\d+)?)s"').firstMatch(body);
+  if (m != null) {
+    final s = double.tryParse(m.group(1)!);
+    if (s != null) return ms(s);
+  }
+  final g = RegExp(r'try again in (?:(\d+)m)?(\d+(?:\.\d+)?)s', caseSensitive: false).firstMatch(body);
+  if (g != null) {
+    final mins = int.tryParse(g.group(1) ?? '0') ?? 0;
+    final s = double.tryParse(g.group(2)!) ?? 0;
+    return ms(mins * 60 + s);
+  }
+  return null;
+}
+
+/// Görev 5: 429 gövdesi günlük kota bitişini mi söylüyor (Gemini `PerDay`, OpenRouter `free-models-per-day`,
+/// Groq `per day`/`daily`)? Gemini'de `limit: 0` ücretsiz katmanda hiç kota olmadığı anlamına gelir.
+bool isDailyQuotaBody(String body) {
+  final lower = body.toLowerCase();
+  return RegExp(r'per[\s_-]?day|daily|limit:\s*0\b').hasMatch(lower);
 }
 
 typedef CloudHttpClientFactory = HttpClient Function();
@@ -321,7 +359,14 @@ class CloudModelService {
       final r = await _send('POST', uri, _headers(p, key), body: body);
       if (r.status != 200) {
         final f = _failureFor(p, r.status, r.body, forModel: true);
-        return CloudModelTestResult(kind: f.kind, message: f.message, statusCode: r.status);
+        final quota = f.kind == CloudCheckKind.quota;
+        return CloudModelTestResult(
+          kind: f.kind,
+          message: f.message,
+          statusCode: r.status,
+          retryAfter: (quota || r.status >= 500) ? parseCloudRetryAfter(r.body, header: r.retryAfterHeader) : null,
+          dailyQuota: quota && isDailyQuotaBody(r.body),
+        );
       }
       watch.stop();
       return CloudModelTestResult(
@@ -361,7 +406,13 @@ class CloudModelService {
         }
         final res = await req.close();
         final text = await utf8.decoder.bind(res).join();
-        return _Reply(res.statusCode, text);
+        String? retryHeader;
+        try {
+          retryHeader = res.headers.value('retry-after');
+        } catch (_) {
+          // Başlıklar okunamıyorsa (sahte istemci vb.) gövdedeki ipuçları kullanılır.
+        }
+        return _Reply(res.statusCode, text, retryAfterHeader: retryHeader);
       }()
           .timeout(timeout);
     } finally {
