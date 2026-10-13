@@ -340,3 +340,33 @@ void stopDevSession(); DevSessionEngine? get devSession; bool get devSessionActi
 - `CancelToken.onCancel` dinleyicisi `CloudDevModelCaller` ve `DevRepoClient/GithubCiRunner` (Görev 2/3) içinde `Future.any` ile birikebilir; günlerce oturumda gözlemlenmeli.
 - AppController bağı `state.running` iken oturum başlatmaz, ancak eski akış sonradan başlarsa wakelock/KeepAlive ortak kullanılır (eski akış `Prompt 8`'de kaldırılacak).
 - Arayüz henüz yok (Görev 7).
+
+
+## GÖREV 7/19: Geliştirme Modu ekranı (tablet odaklı)
+
+### Yapılanlar
+- `lib/presentation/dev_diff_view.dart` (YENİ): `computeLineDiff` (LCS, ortak ön/son ek kırpma, `maxCells` aşılırsa kaba diff, 1500 satırda kesme, değişmeyen satır özeti, SecretMask), `DevDiffView`.
+- `lib/presentation/dev_session_providers.dart` (YENİ): okuma katmanı. `DevSessionFeed` (okuma arayüzü) + `DevStoreFeed` (DevSessionStore+DevLedger bağdaştırıcısı), `DevDiffSource`, `DevSessionControls`, `DevSessionLimits`, `DevViewTuning`, `devSessionViewProvider` (olaylar ≤4 güncelleme/sn, RAM'de en çok 500 olay, `loadOlder`/`jumpToLatest`, oturum/dosya/defter tazeleme), `deriveCiInfo`, `deriveWaitInfo`, `DevEventWindow`, `devElapsed`.
+- `lib/presentation/dev_session_screen.dart` (YENİ): `DevSessionScreen`; ≥1000 dp 3 sütun, 600-1000 dp 2 sütun, <600 dp TabBar. Alttan açılan sayfa yok. Üst şerit (canlı geçen/kalan süre, rozet, commit, CI, aşama, rol modelleri, Duraklat/Devam, Durdur(onaylı), Dalı PR olarak aç), bekleme şeridi, zaman çizgisi, modeller/roller, dosyalar+diff, günlük (seviye filtresi, Daha eski), CI+hata defteri. Sade Mod'da TickerMode kapalı, güncelleme daha seyrek. Ekran kilidi `devWakelockProvider` ile.
+- `test/dev_session_screen_test.dart` (YENİ).
+
+### Public API
+```dart
+const DevSessionScreen();
+// Prompt 8 bu provider'ları override etmeli:
+devSessionFeedProvider (DevSessionFeed? -> DevStoreFeed(store:, ledger:, ciFailureLoader:)),
+devControlsProvider (DevSessionControls?), devDiffSourceProvider (DevDiffSource?),
+devLimitsProvider (DevSessionLimits(maxDuration, maxCommits) <- DevSessionConfig),
+devClockProvider, devWakelockProvider, devOpenUrlProvider, devCopyProvider, devViewTuningProvider
+```
+
+### DOĞRULANAMADI
+- `dart format`, `flutter analyze`, `flutter test` ÇALIŞTIRILAMADI (SDK yok). Hiçbir kod derlenmedi/çalıştırılmadı; testler hiç koşmadı (taşma, süre, 4/sn, 500 sınırı, semantics testleri dahil).
+- Riverpod 2.5 `AutoDisposeNotifier`/`StateProvider.autoDispose` kullanımı, `TabAlignment`, `Tab(height:)`, `t.view` API'leri sürümle doğrulanmadı.
+
+### Bilinen riskler
+- Store yalnızca içerik özeti tuttuğundan diff için `DevDiffSource` (depo/dal okuması) Prompt 8'de bağlanmalı; yoksa ekran özet gösterir.
+- Motor duraklatmayı desteklemiyor; `DevSessionControls.pause/resume` Prompt 8'de eklenmeli (düğmeler denetim yoksa pasif).
+- CI hata listesi olaydaki `files` alanından ya da `ciFailureLoader`'dan gelir; yoksa tek satır ileti.
+- "Daha eski" sonrası pencere kayarken liste konumu sıçrayabilir.
+- Üst şerit 3 sütunda 2-3 satıra uzar; 800 dp yükseklikte sağ paneller dar kalabilir.
