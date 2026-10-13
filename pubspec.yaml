@@ -1,0 +1,41 @@
+# Değişiklik (Görev 1/10): flutter_secure_storage 10.3.4 eklendi (API anahtarı/GitHub token şifreli depolama). 11.x, file_picker 8.x ile win32 çakışması nedeniyle kullanılamadı.
+# Önceki: bulut motoru (Gemini/Groq/OpenRouter) eklendi; yeni paket gerekmedi.
+name: kripton_ai
+description: Kripton Yapay Zekâ Agent
+publish_to: none
+repository: https://github.com/TwilightStarr/Kripton
+version: 1.4.0+40
+
+environment:
+  sdk: ">=3.5.0 <4.0.0"
+
+dependencies:
+  flutter:
+    sdk: flutter
+  flutter_llama: 1.1.2
+  # DOĞRULANAMADI: sürüm/kısıt. `flutter pub get` sonrası pubspec.lock'taki sürümü sabitle.
+  flutter_litert_lm: any
+  flutter_riverpod: ^2.5.1
+  # Android Keystore destekli şifreli depo (10.x: minSdk 23; projede 26). Sürüm sabit.
+  flutter_secure_storage: 10.3.4
+  characters: ^1.3.0
+  archive: ^3.6.1
+  pdf: ^3.11.1
+  open_filex: ^4.5.0
+  wakelock_plus: ^1.2.8
+  file_picker: ^8.1.2
+  path_provider: ^2.1.4
+  path: ^1.9.0
+  crypto: ^3.0.3
+  background_downloader: 9.5.9
+  android_intent_plus: 5.3.1
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+
+flutter:
+  uses-material-design: true
+  assets:
+    - assets/fonts/
+    - assets/self/
