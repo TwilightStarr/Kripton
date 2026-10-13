@@ -1,0 +1,3 @@
+2026-10-11T10:01:31.0091000Z ##[group]Run actions/checkout@v6.0.0
+2026-10-11T10:01:32.0092000Z ##[error]fatal: unable to access 'https://github.com/o/r/': Could not resolve host
+2026-10-11T10:01:33.0093000Z ##[error]Process completed with exit code 128.
