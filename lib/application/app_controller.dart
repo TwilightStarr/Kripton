@@ -10,6 +10,8 @@ import '../data/default_data.dart';
 import '../data/file_service.dart';
 import '../data/flutter_project_check.dart' show ProjectProblem;
 import '../data/github_ci.dart';
+import '../data/github_repo.dart';
+import '../data/cloud_models.dart' show CloudModelService;
 import '../data/cloud_engine.dart';
 import '../data/crash_guard.dart';
 import '../data/llm_engine.dart';
@@ -19,13 +21,18 @@ import '../data/project_snapshot.dart';
 import '../data/project_source.dart';
 import '../data/project_zip.dart';
 import '../data/routing_engine.dart';
+import '../data/secret_mask.dart';
 import '../data/storage.dart';
 import '../domain/entities.dart';
 import '../domain/inference_settings.dart';
 import '../data/workflow_zip_service.dart';
 import 'autopilot.dart';
 import 'ci_batch.dart';
+import 'dev_ledger.dart';
 import 'dev_mode.dart';
+import 'dev_model_pool.dart';
+import 'dev_session_engine.dart';
+import 'dev_session_store.dart';
 import 'engine_lock.dart';
 import 'model_fit.dart';
 import 'settings_controller.dart';
@@ -2157,5 +2164,136 @@ class AppController extends Notifier<AppState> {
     if (ct == null || !state.running || state.cancelling) return;
     state = state.copyWith(cancelling: true, status: 'İptal ediliyor…');
     ct.cancel(); // motoru durdurma (engine.stop) iptali fark eden WorkflowRunner._infer içinde yapılır
+  }
+
+  // ===== Geliştirme Modu v2 (Görev 6/19): DevSessionEngine'e ince bağ =====
+  // Bu bölüm eski akıştan (state.running, _cancel, cancel()) TAMAMEN bağımsızdır: oturum kendi CancelToken'ını
+  // taşır; eski startDevMode'a dokunulmaz. Arayüz sonraki görevde bağlanır.
+  DevSessionEngine? _devEngine;
+
+  /// Çalışan geliştirme oturumu (yoksa null).
+  DevSessionEngine? get devSession => _devEngine;
+
+  bool get devSessionActive => _devEngine != null;
+
+  /// Yeni oturum başlatır; oturum bitince sonucu döner (başlatılamadıysa null ve bildirim gösterilir).
+  Future<DevSessionResult?> startDevSession(DevSessionConfig cfg) => _runDevSession(cfg);
+
+  /// Kayıtlı oturumu AYNI dalda, kayıtlı sayaç ve bloklu dosyalarla sürdürür.
+  Future<DevSessionResult?> resumeDevSession(String sessionId, DevSessionConfig cfg) =>
+      _runDevSession(cfg, resumeId: sessionId);
+
+  /// Oturumu iptal eder (idempotent). Eski akışın [cancel] metodundan bağımsızdır.
+  void stopDevSession() => _devEngine?.cancel();
+
+  Future<DevSessionResult?> _runDevSession(DevSessionConfig cfg, {String? resumeId}) async {
+    if (_devEngine != null) {
+      _notice('Bir geliştirme oturumu zaten çalışıyor.');
+      return null;
+    }
+    if (state.running || state.cancelling) {
+      _notice('Önce çalışan akışı bitir.');
+      return null;
+    }
+    final storage = ref.read(storageProvider);
+    final ciCfg = GithubCiConfig.instance;
+    final cloud = CloudConfig.instance;
+    DevSessionStore? store;
+    var keepAlive = false;
+    var wake = false;
+    try {
+      if (!ciCfg.usable) await ciCfg.load(storage);
+      if (!cloud.anyUsable) await cloud.load(storage);
+      if (!ciCfg.usable) {
+        _notice('GitHub anahtarı veya depo (sahip/depo) eksik ya da geçersiz.');
+        return null;
+      }
+      final repoName = cfg.repo.trim().isEmpty ? ciCfg.repo.trim() : cfg.repo.trim();
+      final baseDir = (await storage.projectsDir()).parent;
+      final id = resumeId ?? 'dev-${DateTime.now().millisecondsSinceEpoch}';
+      store = DevSessionStore(baseDir: baseDir, sessionId: id);
+      DevSessionState? saved;
+      if (resumeId != null) {
+        saved = await store.loadSession();
+        if (saved == null || saved.status == DevSessionStatus.tamamlandi) {
+          _notice('Devam ettirilecek oturum bulunamadı.');
+          return null;
+        }
+      }
+      final logDir = Directory('${baseDir.path}/devlogs');
+      final ledger = DevLedger(dir: logDir);
+      await ledger.load();
+      final ct = CancelToken(); // bu oturuma özgü; eski _cancel ile paylaşılmaz
+      bool cancelled() => ct.cancelled;
+      final repoClient = DevRepoClient(
+        repo: repoName,
+        token: ciCfg.token,
+        cancelled: cancelled,
+        onCancel: ct.onCancel,
+      );
+      final ciRepoClient = DevRepoClient(
+        repo: repoName,
+        token: ciCfg.token,
+        allowWorkflowEdits: true,
+        cancelled: cancelled,
+        onCancel: ct.onCancel,
+      );
+      final runner = GithubCiRunner(
+        repo: repoName,
+        token: ciCfg.token,
+        repoClient: ciRepoClient,
+        cancelled: cancelled,
+        onCancel: ct.onCancel,
+        logStore: CiLogStore(dir: Directory('${logDir.path}/ci')),
+        runTests: ciCfg.runTests,
+        buildApk: ciCfg.buildApk,
+      );
+      final pool = DevModelPool(
+        service: CloudModelService(),
+        config: cloud,
+        trust: ledger.trust,
+        cacheFile: File('${logDir.path}/pool_cache.json'),
+      );
+      await pool.load();
+      await pool.discover();
+      if (!pool.hasUsable) {
+        _notice('Kullanılabilir ücretsiz bulut modeli yok. Bulut ayarlarından en az bir API anahtarı ekle.');
+        return null;
+      }
+      final caller = CloudDevModelCaller(source: cloud, ct: ct);
+      final engine = DevSessionEngine(
+        config: cfg.copyWith(repo: repoName),
+        repo: DevRepoClientPort(repoClient),
+        ci: GithubCiRunnerPort(runner),
+        callModel: caller.call,
+        pool: DevModelPoolPort(pool),
+        store: store,
+        ledger: ledger,
+        cancelToken: ct,
+      );
+      ref.onDispose(engine.cancel);
+      _devEngine = engine;
+      await _wakelock(true);
+      wake = true;
+      await NativeKeepAlive.acquire();
+      keepAlive = true;
+      final res = await engine.run(resumeFrom: saved);
+      if (!_disposed) _notice('Geliştirme oturumu bitti: ${res.message}');
+      return res;
+    } catch (e) {
+      if (!_disposed) _notice('Geliştirme oturumu başlatılamadı: ${SecretMask.redact('$e')}');
+      return null;
+    } finally {
+      _devEngine = null;
+      try {
+        await store?.close();
+      } catch (_) {}
+      if (wake) await _wakelock(false);
+      if (keepAlive) {
+        try {
+          await NativeKeepAlive.release();
+        } catch (_) {}
+      }
+    }
   }
 }

@@ -281,3 +281,62 @@ class DevSessionStore {
 - Olay günlüğü AtomicFile değil, JSONL ekleme + döndürmedir (AtomicFile yalnız JSON dosyalarına uygundur); `session.json`/`changes.json` AtomicFile.
 - Başarısız `recordChange` yazımında bellekteki harita diskten ileride kalabilir.
 - `cloud_models_test.dart` yeni `retryAfter` alanı için genişletilmedi (kapsam dışı).
+
+
+## GÖREV 6/19: Orkestratör (DevSessionEngine)
+
+### Yapılanlar
+- `lib/application/dev_session_engine.dart` (YENİ): durum makinesi hazırlık → dal aç/devam et → planla (bloklu dosyalar hariç) → analiz (analist/geliştirme önericisi) → düzeltme → kapılar (`DevGuard.check`) → bağımsız doğrulayıcı (`parseVerifier`) → commit → Actions → [yeşil: sonraki parça] [kırmızı: `CiFeedback` ile düzeltici → kapılar → doğrulayıcı → commit → tekrar] → kararlılık (ardışık temiz geçiş + CI yeşil) → hedef/geliştirme (varsa) → bitti.
+- Commit TEK yerden (`_commit`) atılır ve yalnızca `GuardVerdict.ok` + doğrulayıcı ONAY sonrası; bağımsız doğrulayıcı yoksa (havuz aynı modeli verirse) commit YOK. Reddedilen yama `DevLedger`'a yazılır (`recordVerdict/recordVerifier`), K (`maxPartRetries`) yeniden denemede `ledger.lessons()` prompt'a eklenir.
+- CI kırmızı: aynı `CiFailureSignature` ≥ `sameSignatureLimit` (3) ya da M (`maxFailedFixes`, 3) üst üste başarısız düzeltme → `revertTo(son yeşil)`, ilgili dosyalar bloklu (olay + defter C1), döngü sürer. Son yeşil yoksa oturum `hata` ile biter (sonsuz döngü yok).
+- `CiInfraError`: AI'ya verilmez; `autopilotBackoff` ile beklenir; `infraWaitingAfter` aşılırsa (ya da auth/actionsDisabled/workflowMissing/startupFailure) durum `bekliyor`, çökmez; toparlanınca `calisiyor`.
+- `DevConflictException`: anlık görüntü yeniden yüklenir, parça baştan işlenir (`maxConflictsInRow` sonrası parça atlanır).
+- Model: her çağrıda `pool.pick`/`pool.report`; `wait` → bekleme olayı (başarısız sayılmaz); `none` → kısa geri çekilmeyle birkaç deneme sonra o parça başarısız.
+- Kontrol noktası: her adım `store.log`, her commit/CI/revert sonrası `saveCheckpoint`; `run(resumeFrom: saved)` aynı dalda (`createWorkBranch(name: saved.branch)`), kayıtlı sayaçlar ve bloklu dosyalarla sürer. Heartbeat: bekleme dilimleri ve döngüde 5 dk'da bir `kalpAtisi`.
+- İptal: motor kendi `CancelToken`'ını tutar (`cancelToken`, `cancel()`); beklemeler `ct.wait` ile; her port çağrısı sonrası `_check()`. Eski `_cancel`/`cancel()`/`state.running` ile paylaşılmaz. Bitişte hiçbir şey birleştirilmez; portta merge YOK; `openPullRequest: true` ise yalnızca TASLAK PR.
+- `lib/application/app_controller.dart`: yalnızca ekleme (sınıf sonu + importlar): `startDevSession`, `resumeDevSession`, `stopDevSession`, `devSession`, `devSessionActive`. Eski `startDevMode`, `_cancel`, `cancel()` DEĞİŞMEDİ.
+- `test/dev_session_engine_test.dart` (YENİ): sahte repo (bellekte commit geçmişi), sahte CI (betik), sahte havuz, betikli AI, sahte saat. 9 zorunlu senaryo + (2b, 4b, 6b, heartbeat, iptal belirteci, PR, azami commit, azami süre).
+
+### Public API
+```dart
+// lib/application/dev_session_engine.dart
+const Duration kDevHeartbeatEvery = Duration(minutes: 5);
+abstract class DevRepoPort { createWorkBranch(base,{name}); loadSnapshotWithInfo(branch); commitChanges(branch, expectedHead, Map<String,String?>, message); revertTo(branch, target, message,{expectedHeadSha}); openPullRequest(head, base, title, body,{draft}); }
+abstract class DevCiPort { Future<CiOutcome> checkBranch(String branch, {void Function(String)? status}); }
+abstract class DevPoolPort { PoolPick pick(String role,{Set<String> exclude, String? differFrom}); bool report(PoolReport r); }
+class DevModelCallException { DevModelCallException(PoolReport report); }
+typedef DevModelCall = Future<String> Function(PoolModel model, String system, String user, CancelToken ct);
+typedef DevSleep = Future<void> Function(Duration d, CancelToken ct);
+class DevRepoClientPort(DevRepoClient) / GithubCiRunnerPort(GithubCiRunner) / DevModelPoolPort(DevModelPool)   // üretim bağdaştırıcıları
+class CloudDevModelCaller { CloudDevModelCaller({required CloudConfig source, required CancelToken ct, int maxTokens=6000}); Future<String> call(PoolModel, String system, String user, CancelToken ct); }
+class DevSessionConfig { const DevSessionConfig({required repo, required baseBranch, goal='', maxDuration=24sa, maxCommits=200, maxConsecutiveFailures=12, stablePassesNeeded=2, maxPartRetries=3, maxFailedFixes=3, sameSignatureLimit=3, maxConflictsInRow=5, maxModelAttempts=6, chunkChars=6000, heartbeatEvery=5dk, infraWaitingAfter=30dk, maxWait=15dk, openPullRequest=false}); copyWith({repo, baseBranch, goal}); }
+enum DevStopReason { kararli, sureDoldu, azamiCommit, azamiHata, iptal, hata, planYok }
+class DevSessionResult { DevSessionStatus status; DevStopReason reason; String branch, headSha, message; int commits; String? prUrl; }
+class DevSessionEngine {
+  DevSessionEngine({required config, required repo, required ci, required callModel, required pool, required store, required ledger, CancelToken? cancelToken, DateTime Function()? now, DevSleep? sleep});
+  final CancelToken cancelToken; void cancel();
+  Future<DevSessionResult> run({DevSessionState? resumeFrom});     // istisna fırlatmaz; her son durum bir sonuçtur
+  Map<String,int> get counters; Set<String> get blockedFiles; String get branch, headSha, lastGreenSha;
+}
+// lib/application/app_controller.dart (AppController)
+Future<DevSessionResult?> startDevSession(DevSessionConfig cfg);
+Future<DevSessionResult?> resumeDevSession(String sessionId, DevSessionConfig cfg);
+void stopDevSession(); DevSessionEngine? get devSession; bool get devSessionActive;
+```
+- Kontrol noktası sözleşmesi: sayaç adları `tur, commit, ret, ciHata, ciYesil, geriAlma, cakisma, bekleme, kararli, gelistirme, imza:<id>`; `DevSessionState.models` içinde `analist/düzeltici/doğrulayıcı` model kimlikleri + `sonYesil` (son yeşil commit SHA) + `hedef` (hedef metni, ≤150 karakter). Arayüz bunları gösterebilir.
+
+### DOĞRULANAMADI
+- `dart format`, `flutter analyze`, `flutter test` ÇALIŞTIRILAMADI (ortamda Dart/Flutter SDK yok, ağ kapalı). Motor ve testler DERLENMEDİ/ÇALIŞTIRILMADI; yalnızca elle gözden geçirildi (parantez dengesi betikle kontrol edildi). "Tüm senaryolar geçer" kabulü bu yüzden DOĞRULANMADI.
+- Testlerin bağlı olduğu varsayımlar: `CiBatcher.plan` ile satır 9'daki tanı için `return a + K;` içeren parça üretilmesi (test 3/4 düzeltici girdisi); `AutopilotChecks.problemsFor` örnek dosyalarda sorun üretmemesi; `PoolPick.ok/wait` const kurucuları; test (9)'da `SecretMask` kayıtlı token'ın tüm yazım yollarında maskelenmesi.
+- `CloudDevModelCaller`: seçilen (sağlayıcı, model) çiftinin yalıtılmış `CloudConfig` ile `CloudEngine`e verilmesi ve `GenerationFailedException.code` ('CLOUD_AUTH/CLOUD_QUOTA/CLOUD_NO_KEY') eşlemesi gerçek bulutla denenmedi. `CloudRetryPolicy(maxWait: 20 sn)` ile kota durumunda hızlı hata dönmesi beklenir.
+- `AppController._runDevSession`: `Storage.projectsDir().parent` ile belgeler klasörü elde edildiği varsayıldı; `DevModelPool.discover()` ağ çağrısı gerçek anahtarlarla denenmedi.
+
+### Bilinen riskler
+- `DevPlanner` imleci kontrol noktasına yazılmıyor (özel alan, kapsam dışı): resume'da planlama dosya başından başlar; kararlılık sayacı (`kararli`) taşınır.
+- Her commit sonrası Actions beklenir (spesifikasyona uygun) → oturum yavaş ama güvenli; CI aynı SHA için mevcut çalışmayı yeniden kullanır (Görev 3).
+- `DevSessionState.counters` ≤ 64 anahtar; `imza:*` sayaçları yeşilde/revert'te temizlenir.
+- İlk CI (taban çizgisi) kırmızıysa ve geri dönülecek yeşil commit yoksa oturum `hata` ile biter (kullanıcı tabanı düzeltmeli).
+- `CiFailure` düzeltmesi yalnızca ilk eşleşen batch için yapılır; kalan tanılar sonraki CI turunda yeniden bildirilir. Tanı bağlanamazsa son commit'in dosyaları kullanılır.
+- `CancelToken.onCancel` dinleyicisi `CloudDevModelCaller` ve `DevRepoClient/GithubCiRunner` (Görev 2/3) içinde `Future.any` ile birikebilir; günlerce oturumda gözlemlenmeli.
+- AppController bağı `state.running` iken oturum başlatmaz, ancak eski akış sonradan başlarsa wakelock/KeepAlive ortak kullanılır (eski akış `Prompt 8`'de kaldırılacak).
+- Arayüz henüz yok (Görev 7).
