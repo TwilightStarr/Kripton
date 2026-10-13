@@ -15,6 +15,7 @@
 // Ağ/AI bağımlılıkları arayüzlerle (port) enjekte edilir; testler sahte repo/CI/model kullanır.
 import 'dart:async';
 
+import '../data/chatml_parser.dart' show neutralizeChatMlMarkers, restoreChatMlMarkers;
 import '../data/ci_feedback.dart';
 import '../data/cloud_engine.dart';
 import '../data/github_ci.dart';
@@ -169,14 +170,16 @@ class CloudDevModelCaller {
     _stop = engine.stop;
     try {
       await engine.ensureLoaded('$kCloudPathPrefix${model.provider.name}');
-      final prompt = '<|im_start|>system\n$system<|im_end|>\n<|im_start|>user\n$user<|im_end|>\n<|im_start|>assistant\n';
+      final prompt = '<|im_start|>system\n${neutralizeChatMlMarkers(system)}<|im_end|>\n'
+          '<|im_start|>user\n${neutralizeChatMlMarkers(user)}<|im_end|>\n'
+          '<|im_start|>assistant\n';
       final b = StringBuffer();
       await for (final t in engine.generate(prompt, maxTokens: _maxTokens)) {
         if (ct.cancelled) throw const CancelledException();
         b.write(t);
       }
       if (ct.cancelled) throw const CancelledException();
-      return b.toString();
+      return restoreChatMlMarkers(b.toString());
     } on CancelledException {
       rethrow;
     } catch (e) {

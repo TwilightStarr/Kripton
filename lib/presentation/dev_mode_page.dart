@@ -545,10 +545,10 @@ class _DevModePageState extends ConsumerState<DevModePage> {
                         onPressed: canStart
                             ? () => c.startDevMode(
                                 DevModeConfig(
-                                  zipPath: _zipPath!,
+                                  zipPath: _zipPath ?? '',
                                   rounds: rounds ?? 1,
-                                  analystModelId: analystId!,
-                                  fixerModelId: fixerId!,
+                                  analystModelId: analystId,
+                                  fixerModelId: fixerId,
                                   coverAll: _coverAll,
                                   autonomous: _auto,
                                   goal: _goal.text.trim(),

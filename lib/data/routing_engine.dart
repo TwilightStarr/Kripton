@@ -69,7 +69,7 @@ class RoutingEngine implements LlmEngine, StreamStatusSource, BackendReporter {
   @override
   LiteRtBackend? get activeBackend {
     final Object? a = _active;
-    return a is BackendReporter ? (a as BackendReporter).activeBackend : null;
+    return a is BackendReporter ? a.activeBackend : null;
   }
 
   @override
@@ -120,12 +120,7 @@ class RoutingEngine implements LlmEngine, StreamStatusSource, BackendReporter {
     try {
       await e.stop();
     } catch (_) {}
-    final Object eo = e;
-    if (eo is UnloadableEngine) {
-      await (eo as UnloadableEngine).unload();
-    } else {
-      await e.dispose(); // LlamaEngine: stop + unload; sonrasında yeniden kullanılabilir
-    }
+    await e.dispose(); // LlamaEngine: stop + unload; sonrasında yeniden kullanılabilir
     if (e.loadedPath != null) {
       throw StateError('$name motoru boşaltılamadı; yeni model yüklenmedi (iki model aynı anda RAM\'e alınmaz).');
     }

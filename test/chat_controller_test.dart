@@ -59,13 +59,9 @@ Uint8List _zip(Map<String, String> files) {
 void main() {
   TestWidgetsFlutterBinding.ensureInitialized();
 
-  Directory? dirOrNull;
-  Directory get dir => dirOrNull!;
-  set dir(Directory d) => dirOrNull = d;
+  late Directory dir;
   late FakeEngine engine;
-  ProviderContainer? containerOrNull;
-  ProviderContainer get container => containerOrNull!;
-  set container(ProviderContainer c) => containerOrNull = c;
+  late ProviderContainer container;
 
   Future<ChatController> boot({
     FakeEngine? e,

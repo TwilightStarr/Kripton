@@ -469,7 +469,7 @@ class CloudCancelToken {
 
 /// Sağlayıcı hatası. Bekleme süresi: [fixedCoolMs] varsa o; yoksa max([hintMs], üstel geri çekilme).
 class _CloudError implements Exception {
-  _CloudError(this.message, this.kind, {this.hintMs, this.fixedCoolMs, this.emitted = 0});
+  _CloudError(this.message, this.kind, {this.hintMs, this.fixedCoolMs, this.emitted = 0, this.capTokens});
 
   final String message;
   final _Kind kind;
@@ -482,6 +482,9 @@ class _CloudError implements Exception {
 
   /// Hatadan önce istemciye iletilen GÖRÜNÜR metin uzunluğu.
   final int emitted;
+
+  /// Sağlayıcının bildirdiği çıktı (max_tokens) üst sınırı; varsa sonraki istekler bu değerle yapılır.
+  final int? capTokens;
 
   @override
   String toString() => message;
@@ -629,6 +632,9 @@ class CloudEngine implements LlmEngine {
   /// Sağlayıcı -> ardışık başarısızlık sayısı (üstel geri çekilme); başarıda sıfırlanır.
   static final Map<CloudProvider, int> _fails = {};
   static final Map<CloudProvider, _Kind> _lastKind = {};
+
+  /// Sağlayıcı -> hata mesajından öğrenilen çıktı token üst sınırı (402 bakiye / 429 OTPM).
+  static final Map<CloudProvider, int> _outCap = {};
   static final math.Random _rnd = math.Random();
 
   static void resetCooldowns() {
@@ -636,6 +642,7 @@ class CloudEngine implements LlmEngine {
     _fails.clear();
     _lastKind.clear();
     _nextCallMs.clear();
+    _outCap.clear();
   }
 
   String? _loaded;
@@ -737,7 +744,7 @@ class CloudEngine implements LlmEngine {
       if (path == null) throw StateError('Bulut modeli seçilmedi.');
       final ChatMlParse parsed;
       try {
-        parsed = parseChatMl(prompt);
+        parsed = parseChatMl(prompt, lenient: true);
       } on ChatMlFormatException catch (e) {
         throw GenerationFailedException(
           'Bulut için istem ChatML olarak ayrıştırılamadı: ${e.message}',
@@ -878,6 +885,14 @@ class CloudEngine implements LlmEngine {
         if (run.cancelled) return;
         final ce = _asCloudError(e);
         _registerFailure(pick, ce);
+        final learned = ce.capTokens;
+        if (learned != null) {
+          final prev = _outCap[pick];
+          if (prev == null || learned < prev) {
+            _outCap[pick] = learned;
+            attempts = math.max(0, attempts - 1); // sınır öğrenildi: bu deneme sayılmaz, hemen yeniden denenir
+          }
+        }
         errors.add('${pick.label}: ${ce.message}');
         CrashGuard.log('Bulut hata', '${pick.label}: ${ce.message}', null);
         if (ce.emitted > 0) {
@@ -1085,7 +1100,7 @@ class CloudEngine implements LlmEngine {
       'model': cfg.model.trim(),
       'stream': true,
       'temperature': 0.2,
-      'max_tokens': math.min(pr.maxOutputCap, maxTokens),
+      'max_tokens': math.min(math.min(pr.maxOutputCap, _outCap[pr] ?? pr.maxOutputCap), maxTokens),
       'messages': [
         for (final m in p.messages) {'role': m.role.name, 'content': m.text},
       ],
@@ -1152,6 +1167,7 @@ class CloudEngine implements LlmEngine {
   }) {
     final brief = _briefBody(body);
     final lower = body.toLowerCase();
+    final cap = _capHint(body);
     String msg;
     _Kind kind;
     int? hint;
@@ -1193,7 +1209,30 @@ class CloudEngine implements LlmEngine {
       fixed = 60 * 1000;
       msg = 'HTTP $status: $brief';
     }
-    return _CloudError(SecretMask.redact(msg), kind, hintMs: hint, fixedCoolMs: fixed, emitted: emitted);
+    if (cap != null) {
+      // Sınır düzeltilebilir bir hata: bekleme yok, düşürülmüş max_tokens ile hemen yeniden denenir.
+      hint = null;
+      fixed = 0;
+      msg = '$msg → çıktı sınırı $cap token\'a indirilecek';
+    }
+    return _CloudError(SecretMask.redact(msg), kind, hintMs: hint, fixedCoolMs: fixed, emitted: emitted, capTokens: cap);
+  }
+
+  /// Hata gövdesinden güvenli bir `max_tokens` değeri çıkarır; yoksa null.
+  ///  * OpenRouter 402: "... can only afford 1599" -> bakiyenin ~%90'ı
+  ///  * Groq 429 OTPM: "output tokens per minute (OTPM): Limit 1000" -> limitin %80'i (1000 -> 800)
+  static int? _capHint(String body) {
+    final afford = RegExp(r'can only afford (\d+)', caseSensitive: false).firstMatch(body);
+    if (afford != null) {
+      final n = int.tryParse(afford.group(1)!);
+      if (n != null && n > 0) return math.max(64, (n * 0.9).floor());
+    }
+    final otpm = RegExp(r'output tokens per minute[^:]*:\s*Limit\s*(\d+)', caseSensitive: false).firstMatch(body);
+    if (otpm != null) {
+      final n = int.tryParse(otpm.group(1)!);
+      if (n != null && n > 0) return math.max(64, (n * 0.8).floor());
+    }
+    return null;
   }
 
   static int? _retryAfterMs(String body, HttpHeaders? headers) {

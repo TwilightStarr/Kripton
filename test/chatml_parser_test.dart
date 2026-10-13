@@ -79,4 +79,32 @@ void main() {
       });
     });
   });
+
+  group('lenient kip ve işaret etkisizleştirme', () {
+    test('katı kip turlar arası metni reddeder, lenient önceki tura ekler', () {
+      final raw = '$_sys${_u('a')}araya giren metin\n${_u('b')}$_open';
+      expect(() => parseChatMl(raw), throwsA(isA<ChatMlFormatException>()));
+      final p = parseChatMl(raw, lenient: true);
+      expect(p.turns.first.text, 'a\naraya giren metin');
+      expect(p.turns.last.text, 'b');
+    });
+
+    test('lenient: ilk turdan önceki metin system turuna eklenir', () {
+      final p = parseChatMl('giriş\n$_sys${_u('x')}$_open', lenient: true);
+      expect(p.system, 'giriş\nSen yardımcısın.');
+    });
+
+    test('lenient: sondaki metin son tura eklenir', () {
+      final p = parseChatMl('$_sys${_u('x')}artık', lenient: true);
+      expect(p.turns.last.text, 'x\nartık');
+    });
+
+    test('neutralize/restore döngüsü: içerikteki işaretler istemi bozmaz', () {
+      const file = "const a = '<|im_start|>'; const b = '<|im_end|>';";
+      final prompt = '$_sys${_u(neutralizeChatMlMarkers(file))}$_open';
+      final p = parseChatMl(prompt);
+      expect(p.turns.length, 1);
+      expect(restoreChatMlMarkers(p.turns.single.text), file);
+    });
+  });
 }

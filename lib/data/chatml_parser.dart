@@ -70,7 +70,11 @@ ChatMlRole _roleOf(String t) {
 /// `<|im_start|>rol\nmetin<|im_end|>\n...` biçimini ayrıştırır. Sondaki açık asistan turu
 /// (`<|im_start|>assistant\n`) mesaj listesine girmez; [ChatMlParse.openAssistant] true olur.
 /// Bozuk girdide [ChatMlFormatException] fırlatır.
-ChatMlParse parseChatMl(String prompt) {
+///
+/// [lenient] true ise tur dışı metin (turlar arası, sondaki ya da ilk turdan önceki) hata sayılmaz:
+/// önceki tura (baştakiyse system turuna) eklenir. Bulut sağlayıcılar için kullanılır; yerel motorlar
+/// katı kalır.
+ChatMlParse parseChatMl(String prompt, {bool lenient = false}) {
   if (!prompt.contains(_kStart)) {
     throw const ChatMlFormatException('istemde <|im_start|> işareti yok (ChatML değil)');
   }
@@ -78,16 +82,36 @@ ChatMlParse parseChatMl(String prompt) {
   var open = false;
   var prefill = '';
   var i = 0;
+  final leading = StringBuffer();
+  // Hoşgörülü kip: tur dışı metni önceki tura ekler (önceki yoksa başa biriktirir).
+  void absorb(String stray) {
+    final t = stray.trim();
+    if (t.isEmpty) return;
+    if (messages.isEmpty) {
+      if (leading.isNotEmpty) leading.write('\n');
+      leading.write(t);
+    } else {
+      final last = messages.removeLast();
+      messages.add(ChatMlMessage(last.role, '${last.text}\n$t'));
+    }
+  }
+
   while (true) {
     final s = prompt.indexOf(_kStart, i);
     if (s < 0) {
       if (prompt.substring(i).trim().isNotEmpty) {
-        throw const ChatMlFormatException('son turdan sonra tur dışı metin var');
+        if (!lenient) {
+          throw const ChatMlFormatException('son turdan sonra tur dışı metin var');
+        }
+        absorb(prompt.substring(i));
       }
       break;
     }
     if (prompt.substring(i, s).trim().isNotEmpty) {
-      throw const ChatMlFormatException('turlar arasında tur dışı metin var');
+      if (!lenient) {
+        throw const ChatMlFormatException('turlar arasında tur dışı metin var');
+      }
+      absorb(prompt.substring(i, s));
     }
     final headStart = s + _kStart.length;
     final nl = prompt.indexOf('\n', headStart);
@@ -123,6 +147,14 @@ ChatMlParse parseChatMl(String prompt) {
     i = end + _kEnd.length;
   }
 
+  if (leading.isNotEmpty) {
+    if (messages.isNotEmpty && messages.first.role == ChatMlRole.system) {
+      messages[0] = ChatMlMessage(ChatMlRole.system, '${leading.toString()}\n${messages.first.text}');
+    } else {
+      messages.insert(0, ChatMlMessage(ChatMlRole.system, leading.toString()));
+    }
+  }
+
   for (var k = 1; k < messages.length; k++) {
     if (messages[k].role == ChatMlRole.system) {
       throw const ChatMlFormatException('system turu yalnızca ilk tur olabilir');
@@ -142,3 +174,16 @@ ChatMlParse parseChatMl(String prompt) {
   }
   return parse;
 }
+
+// Kullanıcı/dosya içeriğindeki ChatML işaretleri istemin turlarını bozmasın diye (Kripton kendi
+// kaynağını okurken `'<|im_start|>'` sabitleri istemin içine girer) tur işaretleri etkisizleştirilir.
+const String _kStartSafe = '<| im_start |>';
+const String _kEndSafe = '<| im_end |>';
+
+/// [text] içindeki gerçek ChatML işaretlerini etkisiz biçime çevirir. [restoreChatMlMarkers] ile geri alınır.
+String neutralizeChatMlMarkers(String text) =>
+    text.replaceAll(_kStart, _kStartSafe).replaceAll(_kEnd, _kEndSafe);
+
+/// [neutralizeChatMlMarkers] işleminin tersi (modelin çıktısındaki işaretleri özgün haline döndürür).
+String restoreChatMlMarkers(String text) =>
+    text.replaceAll(_kStartSafe, _kStart).replaceAll(_kEndSafe, _kEnd);

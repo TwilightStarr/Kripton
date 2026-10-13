@@ -335,7 +335,7 @@ class LiteRtEngine implements LlmEngine, UnloadableEngine, BackendReporter {
       CrashGuard.log('LiteRT üretim hatası', '${failed.label}: ${_brief(error)}', st);
       if (_verified || run.emitted > 0 || !_hasNextBackend) {
         // Kısmi çıktı varsa ya da backend daha önce çalışmışsa yeniden denemek çıktıyı bozar / yanıltır.
-        Error.throwWithStackTrace(error!, st ?? StackTrace.current);
+        Error.throwWithStackTrace(error, st ?? StackTrace.current);
       }
       await _switchToNextBackend(failed, error);
     }

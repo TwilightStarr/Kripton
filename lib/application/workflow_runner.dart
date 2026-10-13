@@ -3,6 +3,7 @@ import 'dart:io';
 import 'dart:isolate';
 import 'dart:math' as math;
 
+import '../data/chatml_parser.dart' show neutralizeChatMlMarkers, restoreChatMlMarkers;
 import '../data/file_service.dart';
 import '../data/llm_engine.dart';
 import '../data/project_snapshot.dart';
@@ -617,6 +618,12 @@ class WorkflowRunner {
         );
       }
     }
+    // Dosya/log içeriğindeki gerçek ChatML işaretleri (Kripton kendi kaynağını okurken sabit olarak
+    // geçer) istemin turlarını bozmasın; modelin çıktısında geri alınır (bkz. return _clean(...)).
+    if (tpl == ChatTemplate.chatml) {
+      sys = neutralizeChatMlMarkers(sys);
+      usr = neutralizeChatMlMarkers(usr);
+    }
     var prompt = applyTemplate(tpl, sys, usr);
     if (batch != null) {
       // Son savunma: eklenti prompt'u tek llama_decode ile işler; batch'ten uzun prompt native'e gitmemeli.
@@ -805,7 +812,7 @@ class WorkflowRunner {
         ),
       ).catchError((Object _) {}),
     );
-    return _clean(b.toString());
+    return _clean(tpl == ChatTemplate.chatml ? restoreChatMlMarkers(b.toString()) : b.toString());
   }
 
   /// Termal denetleyicinin önerdiği thread sayısını, motor destekliyorsa uygular (yalnızca ajan sınırında).

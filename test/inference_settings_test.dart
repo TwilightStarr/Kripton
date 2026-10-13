@@ -1,7 +1,7 @@
 import 'package:flutter_test/flutter_test.dart';
 import 'package:kripton_ai/application/workflow_package_mapper.dart';
 import 'package:kripton_ai/application/workflow_runner.dart';
-import 'package:kripton_ai/data/file_service.dart';
+
 import 'package:kripton_ai/domain/entities.dart';
 import 'package:kripton_ai/domain/inference_settings.dart';
 import 'package:kripton_ai/domain/workflow_package_schema.dart';
@@ -10,7 +10,7 @@ import 'helpers.dart';
 
 /// generate() anındaki örnekleme ayarlarını ve maxTokens'ı kaydeden sahte motor.
 class _CapEngine extends FakeEngine {
-  _CapEngine({super.ctx, super.responder});
+  _CapEngine({super.ctx});
 
   final List<InferenceSettings> seen = [];
   final List<int> maxTokensSeen = [];

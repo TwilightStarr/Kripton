@@ -2710,7 +2710,9 @@ class SymbolIndex {
           if (m == null) continue;
           final pre = m.group(1);
           final nm = m.group(2)!;
-          final ids = pre != null ? sc.prefixed[pre]?[nm] : sc.unprefixed[nm];
+          final ids = (pre != null)
+              ? (sc.prefixed[pre])?[nm]
+              : sc.unprefixed[nm];
           if (ids == null) continue;
           for (final id in ids) {
             final s = _symbolMap[id];
@@ -2815,10 +2817,10 @@ class SymbolIndex {
       for (final e in d.rec.directives) {
         final pk = e.package;
         if (e.uriKind != UriKind.externalPackage || pk == null) continue;
-        final cands = <String>[
-          for (final sec in const ['dependencies', 'dev_dependencies', 'dependency_overrides'])
-            if (_symbolMap.containsKey('pubspec.yaml#$sec.$pk')) 'pubspec.yaml#$sec.$pk',
-        ];
+          final cands = <String>[
+            for (final sec in const ['dependencies', 'dev_dependencies', 'dependency_overrides'])
+              if (_symbolMap.containsKey('pubspec.yaml#$sec.$pk')) 'pubspec.yaml#$sec.$pk',
+          ];
         if (cands.isEmpty) continue;
         final code = d.codeLines[e.line] ?? '';
         for (final t in cands) {

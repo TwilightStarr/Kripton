@@ -844,11 +844,11 @@ jobs:
         req.add(bytes);
       }
       final resp = await req.close().timeout(timeout);
-      final bb = BytesBuilder(copy: false);
+      final chunks = <int>[];
       await for (final chunk in resp.timeout(timeout)) {
-        bb.add(chunk);
+        chunks.addAll(chunk);
       }
-      final text = utf8.decode(bb.takeBytes(), allowMalformed: true);
+      final text = utf8.decode(chunks, allowMalformed: true);
       if (resp.statusCode >= 400) {
         Duration? retry;
         final remaining = resp.headers.value('x-ratelimit-remaining');
@@ -978,11 +978,11 @@ jobs:
         await resp.drain<void>();
         return (resp.statusCode, loc);
       }
-      final bb = BytesBuilder(copy: false);
+      final bytes = <int>[];
       await for (final chunk in resp) {
-        bb.add(chunk);
+        bytes.addAll(chunk);
       }
-      final text = utf8.decode(bb.takeBytes(), allowMalformed: true);
+      final text = utf8.decode(bytes, allowMalformed: true);
       if (resp.statusCode >= 400) throw CiHttpException(resp.statusCode, text);
       return (resp.statusCode, text);
     } finally {

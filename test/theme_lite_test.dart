@@ -6,7 +6,6 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:kripton_ai/application/app_controller.dart';
 import 'package:kripton_ai/application/settings_controller.dart';
 import 'package:kripton_ai/core/theme.dart';
-import 'package:kripton_ai/domain/entities.dart';
 
 import 'helpers.dart';
 
