@@ -6,6 +6,10 @@
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS"/>
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE"/>
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC"/>
+    <!-- Görev 9/19: Android 14+ (API 34) specialUse ön plan servisi; dataSync'in Android 15 zaman aşımı (6 sa / 24 sa) yok -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE"/>
+    <!-- Pil optimizasyonu muafiyeti isteği (ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS); Play dışı dağıtım -->
+    <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS"/>
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE"/>
     <queries>
         <package android:name="com.miui.securitycenter"/>
@@ -39,6 +43,17 @@
             android:name="androidx.work.impl.foreground.SystemForegroundService"
             android:foregroundServiceType="dataSync"
             tools:node="merge"/>
+        <!-- Görev 9/19: Geliştirme oturumunu/üretimi ön planda tutan servis. API 29-33: dataSync; API 34+: specialUse
+             (zaman aşımı yok). Sınıf CI'da (build-apk.yml) üretilir; ad ".KriptonKeepAliveService" ad alanına göre çözülür.
+             Sistem yine de keser/zaman aşımına uğratırsa Service.onTimeout ele alınır (oturum duraklar). -->
+        <service
+            android:name=".KriptonKeepAliveService"
+            android:exported="false"
+            android:foregroundServiceType="dataSync|specialUse">
+            <property
+                android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                android:value="Saatler/günler süren yapay zekâ geliştirme oturumu: GitHub'a commit atar, Actions sonuçlarını bekler; kullanıcının başlattığı uzun iş ön planda canlı tutulur"/>
+        </service>
         <!-- LiteRT-LM GPU delegesi: cihazın OpenCL kütüphanelerine erişim (yoksa uygulama yine kurulur) -->
         <uses-native-library android:name="libOpenCL.so" android:required="false"/>
         <uses-native-library android:name="libOpenCL-pixel.so" android:required="false"/>

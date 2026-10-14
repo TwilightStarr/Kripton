@@ -370,3 +370,61 @@ devClockProvider, devWakelockProvider, devOpenUrlProvider, devCopyProvider, devV
 - CI hata listesi olaydaki `files` alanından ya da `ciFailureLoader`'dan gelir; yoksa tek satır ileti.
 - "Daha eski" sonrası pencere kayarken liste konumu sıçrayabilir.
 - Üst şerit 3 sütunda 2-3 satıra uzar; 800 dp yükseklikte sağ paneller dar kalabilir.
+
+
+## GÖREV 9/19: Uzun süre açık kalma dayanıklılığı
+
+### Yapılanlar
+- **Servis türü:** `dataSync` Android 15'te ~6 sa/24 sa zaman aşımına uğrar (Android belgesiyle doğrulandı). Servis API 34+ `specialUse` (+ `FOREGROUND_SERVICE_SPECIAL_USE`, `PROPERTY_SPECIAL_USE_FGS_SUBTYPE`), API 29–33 `dataSync`. Manifest: `dataSync|specialUse`, `REQUEST_IGNORE_BATTERY_OPTIMIZATIONS`. Servis artık manifestte tanımlı (CI yalnızca eksikse ekler).
+- **Kotlin (build-apk.yml heredoc'u, depoda .kt dosyası yok):** `KriptonKeepAliveService` — `onTimeout(startId)` (API 34) ve `onTimeout(startId, fgsType)` (API 35): zaman aşımını SharedPreferences'a yazar, kullanıcıya bildirim, Dart'a `timeout` olayı, `stopForeground+stopSelf`. `MainActivity`: `kripton/keepalive` kanalına `isIgnoringBatteryOptimizations`, `lastTimeout`; yeni `kripton/keepalive_events` EventChannel; yeni `kripton/thermal` (`getThermalStatus`, `isCharging`).
+- **Dart:** `native_services.dart` (`NativeKeepAlive.events/restart/lastTimeoutSince/startFailed`, `KeepAliveEvent`, `BatteryOptimization`); `dev_session_engine.dart` (kancalar, aşağıda); `app_controller.dart` (yarım oturum tespiti, otomatik devam ayarı, duraklat/devam, bağlama); `dev_session_screen.dart` (yarım oturum/duraklatma/pil uyarı şeritleri); `docs/DEVMODE.md`, README, SECURITY.md; `test/dev_resilience_test.dart`.
+- Motor: `DevPauseGate` (duraklatma kapısı; commit öncesi de durur), ağ hatası = bekleme (`_net`: dal açma, depo okuma, commit, geri alma, Actions; model çağrısında ağ/zaman aşımı hata sayılmaz), kota izleme olayları, termal izleyici, `DevSessionConfig.fromCheckpoint`, süreç kesintisinin süreden sayılmaması, `imza:*` sayaç tavanı (16).
+
+### Public API
+```dart
+// dev_session_engine.dart
+enum DevPauseReason { kullanici, servisZamanAsimi, termal }  // .label
+class DevPauseGate { bool get paused; Set<DevPauseReason> get reasons; bool pause(r); bool resume(r); void resumeAll(); Future<void> waitOpen(); void wake(); void addListener(f); void removeListener(f); }
+typedef DevNetProbe = Future<bool> Function(); Future<bool> devNetworkReachable();
+bool isDevNetworkError(Object e); Duration? devRetryAfterOf(Object e);
+enum DevQuotaLevel { normal, dikkat, kisitli, kritik, tukendi }
+class DevQuotaBudget({hourlyBudget=3000, now, sleep, maxWait=15dk, spacing*}) { int get usedLastHour; double get pressure; DevQuotaLevel get level; Duration get spacing, exhaustedWait; Duration nextDelay(); void recordRequest(); void recordResponse(Map headers); Future<void> pace(CancelToken?); GithubHttpSender wrap(GithubHttpSender inner, {CancelToken? cancel}); }
+const kDevThermalPauseAt = 3; class DevThermalPolicy({pauseAt, resumeAtMost=1, coolHold=90sn}) { bool update(int? status, DateTime now); }
+class DevResilienceMonitor({required gate, thermalStatus, policy, pollEvery=30sn, now}) { start(); Future<void> tick(); dispose(); }
+StreamSubscription<KeepAliveEvent> bindServiceTimeout({required events, required gate, onTimeout});
+DevSessionEngine({..., DevPauseGate? gate, DevQuotaBudget? quota, DevNetProbe? netProbe}); bool pause([reason]); bool resume([reason]); bool get paused; final DevPauseGate gate;
+DevSessionConfig({..., networkBackoffStart=5sn, networkBackoffMax=5dk, networkWaitingAfter=2dk, networkProbeEvery=15sn, maxSnapshotChars=64M}); DevSessionConfig.fromCheckpoint(DevSessionState);
+// kontrol noktası sayaçları: cfgSureDk, cfgMaxCommit, duraklat, agKesinti, kotaYavas
+// native_services.dart
+enum KeepAliveEventKind { started, startFailed, timeout }; class KeepAliveEvent { kind, fgsType, at }
+NativeKeepAlive.events / restart() / lastTimeoutSince(ms) / startFailed / references
+enum BatteryExemptState { granted, denied, unknown }; BatteryOptimization.status() / request()
+// app_controller.dart
+class DevInterruptedSession; interruptedDevSessionProvider; devAutoResumeProvider; keepAliveEventsProvider; devThermalStatusProvider
+AppController: pauseDevSession(); continueDevSession(); devSessionPaused; devPauseReasons; loadDevAutoResume(); setDevAutoResume(bool); findInterruptedDevSession(); resumeInterruptedDevSession()
+// dev_session_screen.dart: devBatteryStateProvider
+```
+Prompt 8 (denetim bağı): `DevSessionControls.pause/resume` → `AppController.pauseDevSession/continueDevSession`; otomatik devam ayarı için bir anahtar `setDevAutoResume`'a bağlanmalı (AppSettings'e dokunulmadı).
+
+### Kapsam dışına çıkılan yerler (gerekçeli)
+- `.github/workflows/build-apk.yml`: Kotlin servis kodu yalnızca bu dosyada üretildiği için düzenlendi.
+- `app_controller.dart`: yarım oturum tespiti dışında `_runDevSession` içine kapı/kota/termal/servis bağlantısı eklendi (özellik bunsuz çalışmaz).
+
+### Yapılamayanlar / kesilenler
+- "Depo ağacı yalnızca yol+hash, içerikler LRU önbellekte": `ProjectSnapshot` tam metin haritası bekler (planlayıcı, DevGuard G6, CiBatcher); bunu değiştirmek `github_repo.dart`/`project_snapshot.dart` (kapsam dışı) gerektirir. Yerine: depo katmanı sınırları (2500 dosya × 400 KB), eşik uyarısı (`maxSnapshotChars`), olay/log/sayaç sınırları + 48 saatlik test. Sonraki görev: diske dayalı içerik + LRU.
+- `SECURITY.md` kapsam listesinde yoktu ama görev 7. madde istediği için güncellendi.
+
+### DOĞRULANAMADI
+- `dart format`, `flutter analyze`, `flutter test` ÇALIŞTIRILAMADI (ortamda Dart/Flutter SDK yok). Hiçbir Dart/Kotlin kodu derlenmedi; testler hiç koşmadı.
+- Kotlin: `@RequiresApi` ile `onTimeout` override'larının derlenmesi/lint'i (`androidx.annotation` erişimi), `Service.onTimeout(int)` API 34 varsayımı; `startForeground(..., SPECIAL_USE)` için manifest `dataSync|specialUse` birleşimi; `specialUse`'un zaman aşımsız olduğu (belgede zaman aşımı listesinde yok; açık bir "yok" ifadesi doğrulanmadı).
+- Gerçek cihazda: Doze/uygulama bekleme, HyperOS'ta servis davranışı, bildirim izni yokken `startForeground`.
+- Testlerin bağlı olduğu varsayımlar: `PoolReport` adlandırılmış kurucusu, `DevSessionStore(now:)`, `GithubHttpRequest/Response` kurucuları, 48 saatlik testte olay günlüğü boyutu (<4 MB) ve infra beklemelerinin 600 sn tavanı, (3)'te `fromCheckpoint` ile depo adı `sahip/depo`.
+- `flutter pub get`: yeni paket eklenmedi (`android_intent_plus` zaten vardı; `native_services.dart` artık onu da import eder).
+
+### Bilinen riskler
+- Duraklatma, süren model/CI çağrısı bitene kadar etkisizdir (CI beklemesi dakikalarca sürebilir).
+- Kota sarmalayıcısı, istek öncesi bekleme yaptığından CI çalıştırıcısının kendi zaman aşımları (`queueTimeout`, `overallTimeout`) kritik düzeyde tetiklenebilir; sonuç `CiInfraError(timeout)` → motor bekler.
+- Yeniden deneme sırasında commit aslında işlenmişse çakışma yolu kullanılır; `commit` sayacı eksik kalabilir.
+- Yarım oturum taraması yalnızca son 7 günü ve en güncel açık oturumu gösterir; eski "çalışıyor" kayıtları listede kalır.
+- Açılışta otomatik devam ayarı için arayüz anahtarı henüz yok (`devAutoResumeProvider` hazır).
+- Mevcut `dev_session_engine_test` (7): kontrol noktası `updatedAt` gerçek saatle, motor sahte saatle çalıştığından kesinti kredisi anlamsız olabilir (testi bozmaması beklenir, doğrulanmadı).

@@ -13,14 +13,17 @@ import 'dart:async';
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
+import '../application/app_controller.dart' show appProvider, interruptedDevSessionProvider;
 import '../application/dev_guard.dart' show DevGate;
 import '../application/dev_ledger.dart' show DevRole;
 import '../application/dev_session_store.dart';
 import '../application/settings_controller.dart';
 import '../core/theme.dart';
+import '../data/native_services.dart' show BatteryExemptState, BatteryOptimization;
 import '../data/secret_mask.dart';
 import 'dev_diff_view.dart';
 import 'dev_session_providers.dart';
+import 'miui_hint.dart' show maybeShowMiuiHint;
 
 /// ≥ bu genişlik: 3 sütun.
 const double kDevWideBreakpoint = 1000;
@@ -453,6 +456,7 @@ class _DevSessionScreenState extends ConsumerState<DevSessionScreen> {
             children: [
               _TopStrip(compact: w < kDevMediumBreakpoint),
               const _WaitBanner(),
+              const _ResilienceBanners(),
               Expanded(
                 child: Padding(
                   padding: const EdgeInsets.fromLTRB(12, 0, 12, 12),
@@ -896,6 +900,113 @@ class _WaitBanner extends ConsumerWidget {
         ),
       ),
     );
+  }
+}
+
+// ------------------------------------------------------------------ dayanıklılık şeritleri (Görev 9/19)
+
+/// Pil muafiyeti durumu (testlerde override edilir). Android dışında/kanal yokken `unknown`.
+final devBatteryStateProvider =
+    FutureProvider.autoDispose<BatteryExemptState>((ref) => BatteryOptimization.status());
+
+class _ResilienceBanners extends ConsumerWidget {
+  const _ResilienceBanners();
+
+  Widget _box(Widget child) => Container(
+        margin: const EdgeInsets.fromLTRB(12, 0, 12, 8),
+        padding: const EdgeInsets.all(10),
+        decoration: BoxDecoration(
+          color: KColors.amber.withOpacity(0.12),
+          borderRadius: BorderRadius.circular(KRadius.sm),
+          border: Border.all(color: KColors.amber),
+        ),
+        child: child,
+      );
+
+  @override
+  Widget build(BuildContext context, WidgetRef ref) {
+    final status = ref.watch(devSessionViewProvider.select((v) => v.session?.status));
+    final note = ref.watch(devSessionViewProvider.select((v) => v.session?.note ?? ''));
+    final interrupted = ref.watch(interruptedDevSessionProvider);
+    final battery = ref.watch(devBatteryStateProvider).valueOrNull ?? BatteryExemptState.unknown;
+    final controls = ref.read(devControlsProvider);
+    final active = status != null && devSessionActiveStatus(status);
+    final items = <Widget>[];
+
+    if (interrupted != null && !active) {
+      final sys = interrupted.serviceTimeout ? ' Ön plan servisi sistem tarafından durdurulmuştu.' : '';
+      items.add(_box(Semantics(
+        liveRegion: true,
+        container: true,
+        child: Row(children: [
+          Icon(Icons.restore, size: 18, color: KColors.amber),
+          const SizedBox(width: 8),
+          Expanded(
+            child: Text(
+              'Yarım kalmış oturum: ${interrupted.branch}.$sys İlerleme kayıtlı; aynı dalda, aynı sayaçlarla sürer.',
+              style: TextStyle(fontSize: 12.5, height: 1.35, color: KColors.text),
+            ),
+          ),
+          TextButton(
+            onPressed: () => ref.read(appProvider.notifier).resumeInterruptedDevSession(),
+            child: const Text('Devam et'),
+          ),
+        ]),
+      )));
+    }
+
+    if (status == DevSessionStatus.duraklatildi) {
+      items.add(_box(Semantics(
+        liveRegion: true,
+        container: true,
+        child: Row(children: [
+          Icon(Icons.pause_circle_outline, size: 18, color: KColors.amber),
+          const SizedBox(width: 8),
+          Expanded(
+            child: Text(
+              note.isEmpty ? 'Oturum duraklatıldı.' : note,
+              style: TextStyle(fontSize: 12.5, height: 1.35, color: KColors.text),
+            ),
+          ),
+          if (controls != null)
+            TextButton(onPressed: () => controls.resume(), child: const Text('Devam')),
+        ]),
+      )));
+    }
+
+    if (active && battery == BatteryExemptState.denied) {
+      items.add(_box(Semantics(
+        container: true,
+        child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+          Row(children: [
+            Icon(Icons.battery_alert, size: 18, color: KColors.amber),
+            const SizedBox(width: 8),
+            Expanded(
+              child: Text(
+                'Pil optimizasyonu açık: telefon uykuya geçince oturum yavaşlayabilir veya sistem tarafından '
+                'durdurulabilir. Oturum çalışır ama uzun süreli kullanım için muafiyet ver ve şarja tak.',
+                style: TextStyle(fontSize: 12.5, height: 1.35, color: KColors.text),
+              ),
+            ),
+          ]),
+          Wrap(spacing: 8, children: [
+            TextButton(
+              onPressed: () async {
+                await BatteryOptimization.request();
+                ref.invalidate(devBatteryStateProvider);
+              },
+              child: const Text('Muafiyet iste'),
+            ),
+            TextButton(
+              onPressed: () => maybeShowMiuiHint(context, force: true),
+              child: const Text('HyperOS/MIUI ayarları'),
+            ),
+          ]),
+        ]),
+      )));
+    }
+    if (items.isEmpty) return const SizedBox.shrink();
+    return Column(children: items);
   }
 }
 

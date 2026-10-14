@@ -6,6 +6,7 @@ import 'package:flutter/painting.dart' show PaintingBinding;
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:wakelock_plus/wakelock_plus.dart';
 
+import '../data/atomic_file.dart';
 import '../data/default_data.dart';
 import '../data/file_service.dart';
 import '../data/flutter_project_check.dart' show ProjectProblem;
@@ -82,6 +83,47 @@ final telemetryServiceProvider = Provider<TelemetryService>((ref) {
 final appProvider = NotifierProvider<AppController, AppState>(
   AppController.new,
 );
+
+// ===== Görev 9/19: uzun süre açık kalma dayanıklılığı (sağlayıcılar) =====
+
+/// Açılışta bulunan yarım kalmış geliştirme oturumu (süreç öldürüldü/telefon kapandı/duraklatılmıştı).
+class DevInterruptedSession {
+  const DevInterruptedSession({
+    required this.id,
+    required this.status,
+    required this.repo,
+    required this.branch,
+    required this.updatedAt,
+    this.serviceTimeout = false,
+  });
+
+  final String id;
+
+  /// Kontrol noktasındaki SON durum (calisiyor/bekliyor: süreç beklenmedik ölmüş; duraklatildi: duraklatılmıştı).
+  final DevSessionStatus status;
+  final String repo;
+  final String branch;
+  final DateTime updatedAt;
+
+  /// Ön plan servisi zaman aşımı kaydı bu oturumun son kontrol noktasından yeni.
+  final bool serviceTimeout;
+
+  /// Ayar açıksa kendiliğinden devam edilebilir mi (kullanıcının bilerek duraklattığı oturum devam ETTİRİLMEZ).
+  bool get autoResumable => status == DevSessionStatus.calisiyor || status == DevSessionStatus.bekliyor;
+}
+
+/// Arayüz bu sağlayıcıyı izleyip yarım oturum bandı gösterir. Devam: `resumeInterruptedDevSession`.
+final interruptedDevSessionProvider = StateProvider<DevInterruptedSession?>((ref) => null);
+
+/// "Açılışta yarım oturuma otomatik devam et" ayarı (varsayılan KAPALI: belirteç/kota harcar). Kalıcı:
+/// `dev_resume_prefs.json` (AppSettings'e dokunulmaz).
+final devAutoResumeProvider = StateProvider<bool>((ref) => false);
+
+/// Ön plan servisi olayları (testlerde sahte akış verilir).
+final keepAliveEventsProvider = Provider<Stream<KeepAliveEvent>>((ref) => NativeKeepAlive.events);
+
+/// Termal durum okuyucu (0..6; yoksa null). Testlerde değiştirilebilir.
+final devThermalStatusProvider = Provider<Future<int?> Function()>((ref) => DeviceThermal.status);
 
 class AppState {
   final bool loaded;
@@ -330,6 +372,7 @@ class AppController extends Notifier<AppState> {
           ? null
           : wfs.first.agents.first.id,
     );
+    unawaited(_checkInterruptedDevSession());
   }
 
   void _notice(String m) {
@@ -2186,6 +2229,134 @@ class AppController extends Notifier<AppState> {
   /// Oturumu iptal eder (idempotent). Eski akışın [cancel] metodundan bağımsızdır.
   void stopDevSession() => _devEngine?.cancel();
 
+  // ===== Görev 9/19: duraklat/devam ve yarım oturum =====
+  DevPauseGate? _devGate;
+
+  /// Oturum duraklatılmış mı (kullanıcı, servis zaman aşımı veya termal neden).
+  bool get devSessionPaused => _devGate?.paused ?? false;
+
+  /// Etkin duraklatma nedenleri (arayüz metni için).
+  Set<DevPauseReason> get devPauseReasons => _devGate?.reasons ?? const <DevPauseReason>{};
+
+  /// Kullanıcı duraklatması. Süren çağrı bitince durur; ilerleme kontrol noktasına hemen yazılır.
+  void pauseDevSession() => _devGate?.pause(DevPauseReason.kullanici);
+
+  /// Duraklatılmış oturumu sürdürür. Servis zaman aşımıysa ön plan servisi yeniden başlatılır (uygulama
+  /// ön plandayken izinlidir). Termal neden kullanıcı onayıyla kalkmaz; cihaz soğuyunca kendiliğinden kalkar.
+  Future<void> continueDevSession() async {
+    final g = _devGate;
+    if (g == null) return;
+    if (g.reasons.contains(DevPauseReason.servisZamanAsimi)) {
+      try {
+        await NativeKeepAlive.restart();
+      } catch (_) {}
+    }
+    g.resume(DevPauseReason.servisZamanAsimi);
+    g.resume(DevPauseReason.kullanici);
+  }
+
+  Future<Directory> _devBaseDir() async => (await ref.read(storageProvider).projectsDir()).parent;
+
+  /// Açılışta otomatik devam ayarını okur (kalıcı dosya; yoksa kapalı).
+  Future<bool> loadDevAutoResume() async {
+    var v = false;
+    try {
+      final j = await AtomicFile.readJson('${(await _devBaseDir()).path}/dev_resume_prefs.json');
+      v = j is Map && j['autoResume'] == true;
+    } catch (_) {}
+    if (!_disposed) ref.read(devAutoResumeProvider.notifier).state = v;
+    return v;
+  }
+
+  Future<void> setDevAutoResume(bool v) async {
+    if (!_disposed) ref.read(devAutoResumeProvider.notifier).state = v;
+    try {
+      await AtomicFile.writeJson('${(await _devBaseDir()).path}/dev_resume_prefs.json', {'autoResume': v});
+    } catch (_) {}
+  }
+
+  /// En son güncellenen YARIM oturumu (calisiyor/bekliyor/duraklatildi) bulur; 7 günden eskiyi yok sayar.
+  /// Bu çağrı yalnızca süreç açılışında anlamlıdır: çalışan motor yokken "çalışıyor" kalmış kayıt = süreç ölmüştür.
+  Future<DevInterruptedSession?> findInterruptedDevSession() async {
+    if (_devEngine != null) return null;
+    final base = await _devBaseDir();
+    final probe = DevSessionStore(baseDir: base, sessionId: 'tarama');
+    try {
+      final all = await probe.listSessions(limit: 20);
+      final cutoff = DateTime.now().toUtc().subtract(const Duration(days: 7));
+      for (final info in all) {
+        final open = info.status == DevSessionStatus.calisiyor ||
+            info.status == DevSessionStatus.bekliyor ||
+            info.status == DevSessionStatus.duraklatildi;
+        if (!info.readable || !open || info.updatedAt.isBefore(cutoff)) continue;
+        final one = DevSessionStore(baseDir: base, sessionId: info.id);
+        DevSessionState? saved;
+        try {
+          saved = await one.loadSession();
+        } finally {
+          await one.close();
+        }
+        if (saved == null) continue;
+        final t = await NativeKeepAlive.lastTimeoutSince(saved.updatedAt.millisecondsSinceEpoch - 60000);
+        return DevInterruptedSession(
+          id: info.id,
+          status: saved.status,
+          repo: saved.repo,
+          branch: saved.branch,
+          updatedAt: saved.updatedAt,
+          serviceTimeout: t != null,
+        );
+      }
+      return null;
+    } finally {
+      await probe.close();
+    }
+  }
+
+  Future<void> _checkInterruptedDevSession() async {
+    try {
+      final auto = await loadDevAutoResume();
+      final found = await findInterruptedDevSession();
+      if (_disposed) return;
+      ref.read(interruptedDevSessionProvider.notifier).state = found;
+      if (found == null) return;
+      _notice(
+        found.status == DevSessionStatus.duraklatildi
+            ? 'Duraklatılmış bir geliştirme oturumu var (${found.branch}).'
+            : 'Yarım kalmış bir geliştirme oturumu bulundu (${found.branch}); uygulama beklenmedik kapanmış olabilir.',
+      );
+      if (auto && found.autoResumable) unawaited(resumeInterruptedDevSession());
+    } catch (e, st) {
+      CrashGuard.log('Yarım oturum denetimi', e, st);
+    }
+  }
+
+  /// Bulunan yarım oturumu AYNI dalda, aynı sayaç ve bloklu dosyalarla sürdürür (başlatılamazsa bant geri gelir).
+  Future<DevSessionResult?> resumeInterruptedDevSession() async {
+    final it = ref.read(interruptedDevSessionProvider);
+    if (it == null) {
+      _notice('Devam ettirilecek yarım oturum yok.');
+      return null;
+    }
+    ref.read(interruptedDevSessionProvider.notifier).state = null;
+    DevSessionState? saved;
+    final one = DevSessionStore(baseDir: await _devBaseDir(), sessionId: it.id);
+    try {
+      saved = await one.loadSession();
+    } finally {
+      await one.close();
+    }
+    if (saved == null) {
+      _notice('Oturum kaydı okunamadı.');
+      return null;
+    }
+    final res = await resumeDevSession(it.id, DevSessionConfig.fromCheckpoint(saved));
+    if (res == null && !_disposed && _devEngine == null) {
+      ref.read(interruptedDevSessionProvider.notifier).state = it; // başlatılamadı: bant kalsın
+    }
+    return res;
+  }
+
   Future<DevSessionResult?> _runDevSession(DevSessionConfig cfg, {String? resumeId}) async {
     if (_devEngine != null) {
       _notice('Bir geliştirme oturumu zaten çalışıyor.');
@@ -2201,6 +2372,8 @@ class AppController extends Notifier<AppState> {
     DevSessionStore? store;
     var keepAlive = false;
     var wake = false;
+    DevResilienceMonitor? monitor;
+    StreamSubscription<KeepAliveEvent>? timeoutSub;
     try {
       if (!ciCfg.usable) await ciCfg.load(storage);
       if (!cloud.anyUsable) await cloud.load(storage);
@@ -2225,15 +2398,21 @@ class AppController extends Notifier<AppState> {
       await ledger.load();
       final ct = CancelToken(); // bu oturuma özgü; eski _cancel ile paylaşılmaz
       bool cancelled() => ct.cancelled;
+      // Görev 9/19: tüm GitHub istekleri saatlik bütçeden sayılır; kota azalınca istekler seyrekleşir.
+      final quota = DevQuotaBudget();
+      final GithubHttpSender sender = quota.wrap(githubHttpSend, cancel: ct);
+      final gate = DevPauseGate();
       final repoClient = DevRepoClient(
         repo: repoName,
         token: ciCfg.token,
+        send: sender,
         cancelled: cancelled,
         onCancel: ct.onCancel,
       );
       final ciRepoClient = DevRepoClient(
         repo: repoName,
         token: ciCfg.token,
+        send: sender,
         allowWorkflowEdits: true,
         cancelled: cancelled,
         onCancel: ct.onCancel,
@@ -2242,6 +2421,7 @@ class AppController extends Notifier<AppState> {
         repo: repoName,
         token: ciCfg.token,
         repoClient: ciRepoClient,
+        send: sender,
         cancelled: cancelled,
         onCancel: ct.onCancel,
         logStore: CiLogStore(dir: Directory('${logDir.path}/ci')),
@@ -2270,13 +2450,27 @@ class AppController extends Notifier<AppState> {
         store: store,
         ledger: ledger,
         cancelToken: ct,
+        gate: gate,
+        quota: quota,
       );
       ref.onDispose(engine.cancel);
       _devEngine = engine;
+      _devGate = gate;
       await _wakelock(true);
       wake = true;
       await NativeKeepAlive.acquire();
       keepAlive = true;
+      // Servis zaman aşımı → oturum duraklar (çökmez), kontrol noktası yazılır, kullanıcı bilgilendirilir.
+      timeoutSub = bindServiceTimeout(
+        events: ref.read(keepAliveEventsProvider),
+        gate: gate,
+        onTimeout: (_) => _notice(
+          'Sistem arka plan servisini durdurdu; oturum duraklatıldı ve ilerleme kaydedildi. '
+          'Devam etmek için uygulamayı açıp Devam\'a dokun.',
+        ),
+      );
+      // Aşırı ısınmada otomatik duraklat, soğuyunca devam (ThermalGovernor ile aynı eşik: SEVERE ve üstü).
+      monitor = DevResilienceMonitor(gate: gate, thermalStatus: ref.read(devThermalStatusProvider))..start();
       final res = await engine.run(resumeFrom: saved);
       if (!_disposed) _notice('Geliştirme oturumu bitti: ${res.message}');
       return res;
@@ -2285,6 +2479,11 @@ class AppController extends Notifier<AppState> {
       return null;
     } finally {
       _devEngine = null;
+      _devGate = null;
+      monitor?.dispose();
+      try {
+        await timeoutSub?.cancel();
+      } catch (_) {}
       try {
         await store?.close();
       } catch (_) {}

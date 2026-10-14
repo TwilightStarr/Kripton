@@ -233,6 +233,13 @@ Doğrudan APK üretmek için:
 
 ---
 
+#### Uzun süre açık kalma (Geliştirme Modu v2)
+
+Oturum saatlerce/günlerce açık kalabilir: ağ kopması bekleme sayılır (tavanlı üstel geri çekilme), süreç ölürse açılışta
+**"Yarım kalmış oturum"** bandı çıkar (ayar açıksa otomatik devam; aynı dal, sayaçlar ve bloklu dosyalar), ön plan servisi
+sistem tarafından kesilirse oturum duraklayıp bildirim gösterir, aşırı ısınmada otomatik duraklar/devam eder, GitHub
+kotası azalınca yoklama seyrekleşir. Pil muafiyeti verilmezse ekranda uyarı görünür. Ayrıntılar: [docs/DEVMODE.md](docs/DEVMODE.md).
+
 ## Bellek, kararlılık ve arka plan
 
 Yerel modeller telefonlarda bellek baskısıyla karşılaşır. Kripton bunu şu mekanizmalarla yönetir:
@@ -244,7 +251,8 @@ Yerel modeller telefonlarda bellek baskısıyla karşılaşır. Kripton bunu şu
 - **Termal yönetim:** tok/sn düşüşü ve Android termal durumuna göre iş parçacığı sayısı kademeli ayarlanır.
 - **Çökme izleme:** Yarım kalan native işlemler ve Android `ApplicationExitInfo` kayıtları (bellek yetersizliği,
   native çökme vb.) açılışta sınıflandırılıp kullanıcıya anlaşılır biçimde gösterilir.
-- **Ön plan servisi:** Üretim sırasında süreç, bildirimli bir `dataSync` servisiyle ön planda tutulur.
+- **Ön plan servisi:** Üretim ve geliştirme oturumu sırasında süreç bildirimli bir servisle ön planda tutulur
+  (Android 14+ `specialUse`, 29–33 `dataSync`; Android 15 `onTimeout` ele alınır: oturum çökmeden duraklar).
 - **HyperOS/Xiaomi ipuçları:** Arka plan kısıtlamalarına karşı pil, otomatik başlatma ve son uygulamalarda kilitleme
   yönergeleri ilk kullanımda gösterilir.
 

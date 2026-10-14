@@ -26,3 +26,9 @@ Bu bir hobi/deneysel projedir; yanıt süresi için söz verilemez, ancak bildir
 - GitHub token'ı için en az yetkiyi verin (fine-grained, yalnızca ilgili depo).
 - Yapay zekâ ile üretilen veya düzeltilen kod güvenilmez kabul edilmelidir; çalıştırmadan önce inceleyin.
 - Yalnızca bu deponun **Releases** sayfasındaki APK'ları kullanın ve `.sha256` dosyasıyla doğrulayın.
+- **Geliştirme Modu v2:** yapay zekâlar yalnızca `kripton/` çalışma dallarına commit atar; varsayılan dala yazılmaz ve
+  hiçbir şey otomatik birleştirilmez. Token'ı yalnızca ilgili depo için fine-grained verin (bkz. docs/DEVMODE.md).
+- **Uzun süre açık kalma:** kontrol noktası, olay ve CI günlükleri sır içermez (yazmadan önce maskelenir); GitHub istek
+  sayacı yalnızca sayı tutar. Ön plan servisi `specialUse` türüyle çalışır; pil muafiyeti isteği
+  (`REQUEST_IGNORE_BATTERY_OPTIMIZATIONS`) yalnızca sistem penceresini açar, başka bir yetki vermez. Açılışta otomatik
+  devam varsayılan **kapalıdır** (yeni belirteç/kota harcamaz); açtığınızda yalnızca kayıtlı oturum aynı dalda sürer.

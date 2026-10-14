@@ -14,6 +14,7 @@
 //
 // Ağ/AI bağımlılıkları arayüzlerle (port) enjekte edilir; testler sahte repo/CI/model kullanır.
 import 'dart:async';
+import 'dart:io' show HandshakeException, HttpException, InternetAddress, SocketException, TlsException;
 
 import '../data/chatml_parser.dart' show neutralizeChatMlMarkers, restoreChatMlMarkers;
 import '../data/ci_feedback.dart';
@@ -22,6 +23,7 @@ import '../data/github_ci.dart';
 import '../data/flutter_project_check.dart' show ProjectProblem;
 import '../data/github_repo.dart';
 import '../data/llm_engine.dart' show GenerationFailedException;
+import '../data/native_services.dart' show KeepAliveEvent, KeepAliveEventKind;
 import '../data/project_snapshot.dart';
 import '../data/secret_mask.dart';
 import 'autopilot.dart';
@@ -75,6 +77,411 @@ typedef DevModelCall = Future<String> Function(PoolModel model, String system, S
 
 /// İptal edilebilir uyku (testlerde sahte saati ilerletir).
 typedef DevSleep = Future<void> Function(Duration d, CancelToken ct);
+
+// ====================================================================== Görev 9/19: dayanıklılık
+
+/// Oturumu duraklatan nedenler. Aynı anda birden çok neden etkin olabilir; hepsi kalkınca oturum sürer.
+enum DevPauseReason { kullanici, servisZamanAsimi, termal }
+
+extension DevPauseReasonText on DevPauseReason {
+  String get label {
+    switch (this) {
+      case DevPauseReason.kullanici:
+        return 'kullanıcı duraklattı';
+      case DevPauseReason.servisZamanAsimi:
+        return 'ön plan servisi sistem tarafından durduruldu (zaman aşımı)';
+      case DevPauseReason.termal:
+        return 'cihaz aşırı ısındı';
+    }
+  }
+}
+
+/// Duraklatma kapısı: motor her adımın başında [waitOpen] ile buraya uğrar. Duraklatma süren çağrıyı (model/CI)
+/// yarıda kesmez; çağrı bitince bir sonraki kapıda bekler. Commit zaten atomik olduğundan veri kaybı olmaz.
+class DevPauseGate {
+  final Set<DevPauseReason> _reasons = <DevPauseReason>{};
+  final List<void Function(Set<DevPauseReason> reasons)> _listeners = <void Function(Set<DevPauseReason>)>[];
+  Completer<void>? _open;
+
+  bool get paused => _reasons.isNotEmpty;
+
+  Set<DevPauseReason> get reasons => Set<DevPauseReason>.unmodifiable(_reasons);
+
+  /// Neden kümesi her değiştiğinde çağrılır (dinleyici hataları yutulur).
+  void addListener(void Function(Set<DevPauseReason> reasons) l) => _listeners.add(l);
+
+  void removeListener(void Function(Set<DevPauseReason> reasons) l) => _listeners.remove(l);
+
+  /// Yeni bir neden eklendiyse true.
+  bool pause(DevPauseReason r) {
+    if (!_reasons.add(r)) return false;
+    _notify();
+    return true;
+  }
+
+  /// Neden kaldırıldıysa true; hiç neden kalmadıysa bekleyenler uyanır.
+  bool resume(DevPauseReason r) {
+    if (!_reasons.remove(r)) return false;
+    _notify();
+    if (_reasons.isEmpty) wake();
+    return true;
+  }
+
+  /// Tüm nedenleri kaldırır (kullanıcı Devam dediğinde).
+  void resumeAll() {
+    if (_reasons.isEmpty) return;
+    _reasons.clear();
+    _notify();
+    wake();
+  }
+
+  /// Duraklatma yoksa hemen döner; varsa [wake]/[resume] çağrılana kadar bekler (dinleyici BİRİKTİRMEZ).
+  Future<void> waitOpen() {
+    if (!paused) return Future<void>.value();
+    return (_open ??= Completer<void>()).future;
+  }
+
+  /// Bekleyenleri uyandırır (neden kümesine dokunmaz; iptalde motor kullanır).
+  void wake() {
+    final c = _open;
+    _open = null;
+    if (c != null && !c.isCompleted) c.complete();
+  }
+
+  void _notify() {
+    final snapshot = reasons;
+    for (final l in List<void Function(Set<DevPauseReason>)>.of(_listeners)) {
+      try {
+        l(snapshot);
+      } catch (_) {}
+    }
+  }
+}
+
+/// Ağ yoklaması (testlerde sahte). true: internet erişilebilir görünüyor.
+typedef DevNetProbe = Future<bool> Function();
+
+/// Varsayılan yoklama: `api.github.com` adı çözülebiliyor mu (5 sn). Doze/uçak modunda false döner.
+Future<bool> devNetworkReachable() async {
+  try {
+    final r = await InternetAddress.lookup('api.github.com').timeout(const Duration(seconds: 5));
+    return r.isNotEmpty;
+  } catch (_) {
+    return false;
+  }
+}
+
+/// Ağ/geçici sunucu hatası mı? Evet ise başarısızlık değil BEKLEME sayılır.
+/// 401/403(sınırsız)/404/409/422 gibi kalıcı hatalar burada false döner (yükselir).
+bool isDevNetworkError(Object e) {
+  if (e is SocketException ||
+      e is TimeoutException ||
+      e is HandshakeException ||
+      e is TlsException ||
+      e is HttpException) {
+    return true;
+  }
+  if (e is CiTransientException) return true;
+  if (e is CiHttpException) {
+    final s = e.status;
+    return s <= 0 || s == 408 || s == 429 || s >= 500 || e.retryAfter != null;
+  }
+  return false;
+}
+
+/// Sunucunun istediği bekleme (varsa).
+Duration? devRetryAfterOf(Object e) => e is CiHttpException ? e.retryAfter : null;
+
+// ------------------------------------------------------------------ GitHub kota bütçesi
+
+/// Kota baskısı. Düzey yükseldikçe istekler arası asgari aralık büyür (yoklama seyrekleşir).
+enum DevQuotaLevel { normal, dikkat, kisitli, kritik, tukendi }
+
+/// Saatlik GitHub istek bütçesi: istekleri dakika kovalarında sayar (RAM'de en çok ~61 giriş) ve yanıt
+/// başlıklarındaki `x-ratelimit-*` değerlerini de dikkate alır. [wrap], `GithubHttpSender`'ı sarar; böylece
+/// `DevRepoClient` ve `GithubCiRunner`'ın tüm istekleri (CI yoklaması dahil) sayılır ve yavaşlatılır.
+class DevQuotaBudget {
+  DevQuotaBudget({
+    this.hourlyBudget = 3000,
+    DateTime Function()? now,
+    Future<void> Function(Duration d, CancelToken? ct)? sleep,
+    this.maxWait = const Duration(minutes: 15),
+    this.spacingAttention = const Duration(seconds: 5),
+    this.spacingLimited = const Duration(seconds: 20),
+    this.spacingCritical = const Duration(seconds: 60),
+  })  : _now = now ?? DateTime.now,
+        _sleep = sleep ?? _defaultSleep;
+
+  /// Bu oturumun saatlik ayıracağı istek sayısı (GitHub kişisel belirteç sınırı 5000/sa; geri kalanı
+  /// kullanıcının başka işleri içindir).
+  final int hourlyBudget;
+  final Duration maxWait;
+  final Duration spacingAttention;
+  final Duration spacingLimited;
+  final Duration spacingCritical;
+  final DateTime Function() _now;
+  final Future<void> Function(Duration d, CancelToken? ct) _sleep;
+
+  final Map<int, int> _perMinute = <int, int>{};
+  int? _remaining;
+  int? _limit;
+  DateTime? _resetAt;
+  DateTime? _lastSentAt;
+
+  /// Toplam sayaç (yalnızca bilgi; bellekte tek tamsayı).
+  int totalRequests = 0;
+
+  static Future<void> _defaultSleep(Duration d, CancelToken? ct) =>
+      ct == null ? Future<void>.delayed(d) : ct.wait(d);
+
+  int _minuteOf(DateTime t) => t.millisecondsSinceEpoch ~/ 60000;
+
+  void _prune() {
+    final cutoff = _minuteOf(_now()) - 60;
+    _perMinute.removeWhere((m, _) => m <= cutoff);
+  }
+
+  /// Son 60 dakikadaki istek sayısı.
+  int get usedLastHour {
+    _prune();
+    var n = 0;
+    for (final v in _perMinute.values) {
+      n += v;
+    }
+    return n;
+  }
+
+  /// Başlıklardan öğrenilen kalan hak (sıfırlanma zamanı geçtiyse bilinmiyor sayılır).
+  int? get remaining {
+    _forgetStaleHeaders();
+    return _remaining;
+  }
+
+  void _forgetStaleHeaders() {
+    final r = _resetAt;
+    if (r != null && !_now().isBefore(r)) {
+      _remaining = null;
+      _limit = null;
+      _resetAt = null;
+    }
+  }
+
+  /// 0..1+ arası kullanım oranı (bütçe sayacı ile başlıklardan hangisi kötüyse).
+  double get pressure {
+    _forgetStaleHeaders();
+    final byCount = hourlyBudget <= 0 ? 1.0 : usedLastHour / hourlyBudget;
+    var byHeader = 0.0;
+    final lim = _limit;
+    final rem = _remaining;
+    if (lim != null && lim > 0 && rem != null) byHeader = 1.0 - (rem / lim);
+    return byCount > byHeader ? byCount : byHeader;
+  }
+
+  DevQuotaLevel get level {
+    _forgetStaleHeaders();
+    if (_remaining != null && _remaining! <= 0) return DevQuotaLevel.tukendi;
+    final p = pressure;
+    if (p >= 1.0) return DevQuotaLevel.tukendi;
+    if (p >= 0.90) return DevQuotaLevel.kritik;
+    if (p >= 0.75) return DevQuotaLevel.kisitli;
+    if (p >= 0.50) return DevQuotaLevel.dikkat;
+    return DevQuotaLevel.normal;
+  }
+
+  /// Düzeye göre istekler arası asgari aralık ([DevQuotaLevel.tukendi] için [exhaustedWait]).
+  Duration get spacing {
+    switch (level) {
+      case DevQuotaLevel.normal:
+        return Duration.zero;
+      case DevQuotaLevel.dikkat:
+        return spacingAttention;
+      case DevQuotaLevel.kisitli:
+        return spacingLimited;
+      case DevQuotaLevel.kritik:
+        return spacingCritical;
+      case DevQuotaLevel.tukendi:
+        return exhaustedWait;
+    }
+  }
+
+  /// Kota bittiğinde bekleme: bilinen sıfırlanmaya, yoksa en eski kovanın düşmesine kadar (en çok [maxWait]).
+  Duration get exhaustedWait {
+    final r = _resetAt;
+    var d = Duration.zero;
+    if (r != null) {
+      d = r.difference(_now());
+    } else {
+      _prune();
+      if (_perMinute.isNotEmpty) {
+        var oldest = _perMinute.keys.first;
+        for (final m in _perMinute.keys) {
+          if (m < oldest) oldest = m;
+        }
+        final free = DateTime.fromMillisecondsSinceEpoch((oldest + 61) * 60000, isUtc: true);
+        d = free.difference(_now());
+      }
+    }
+    if (d < const Duration(seconds: 1)) d = const Duration(seconds: 1);
+    return d > maxWait ? maxWait : d;
+  }
+
+  /// Bir sonraki isteğe kadar beklenmesi gereken süre.
+  Duration nextDelay() {
+    final lv = level;
+    if (lv == DevQuotaLevel.normal) return Duration.zero;
+    if (lv == DevQuotaLevel.tukendi) return exhaustedWait;
+    final last = _lastSentAt;
+    if (last == null) return Duration.zero;
+    final d = last.add(spacing).difference(_now());
+    return d.isNegative ? Duration.zero : d;
+  }
+
+  void recordRequest() {
+    totalRequests++;
+    final m = _minuteOf(_now());
+    _perMinute[m] = (_perMinute[m] ?? 0) + 1;
+    _prune();
+  }
+
+  /// `x-ratelimit-remaining/limit/reset` başlıklarını işler (başlık adları küçük harf).
+  void recordResponse(Map<String, String> headers) {
+    final rem = int.tryParse(headers['x-ratelimit-remaining'] ?? '');
+    final lim = int.tryParse(headers['x-ratelimit-limit'] ?? '');
+    final reset = int.tryParse(headers['x-ratelimit-reset'] ?? '');
+    if (rem != null) _remaining = rem;
+    if (lim != null) _limit = lim;
+    if (reset != null) _resetAt = DateTime.fromMillisecondsSinceEpoch(reset * 1000, isUtc: true);
+  }
+
+  /// İstekten önce çağrılır; gerekirse bekler (iptal edilebilir).
+  Future<void> pace(CancelToken? ct) async {
+    final w = nextDelay();
+    if (w > Duration.zero) await _sleep(w, ct);
+    _lastSentAt = _now();
+  }
+
+  /// `DevRepoClient(send: quota.wrap(githubHttpSend, cancel: ct))` biçiminde kullanılır.
+  GithubHttpSender wrap(GithubHttpSender inner, {CancelToken? cancel}) => (GithubHttpRequest r) async {
+        await pace(cancel);
+        if (cancel != null && cancel.cancelled) throw const CiCancelledException();
+        recordRequest();
+        final resp = await inner(r);
+        recordResponse(resp.headers);
+        return resp;
+      };
+}
+
+// ------------------------------------------------------------------ termal ilke ve izleyici
+
+/// Android termal durumu (0..6; THERMAL_STATUS_NONE..SHUTDOWN). Eşikler `autopilotNeedsCooldown` (≥3) ile aynı.
+const int kDevThermalPauseAt = 3;
+
+/// Histerezisli termal karar: [kDevThermalPauseAt] ve üstünde duraklat; LIGHT (1) ve altına inip
+/// [coolHold] boyunca öyle kalınca devam et. Saf mantık: zaman dışarıdan verilir.
+class DevThermalPolicy {
+  DevThermalPolicy({
+    this.pauseAt = kDevThermalPauseAt,
+    this.resumeAtMost = 1,
+    this.coolHold = const Duration(seconds: 90),
+  });
+
+  final int pauseAt;
+  final int resumeAtMost;
+  final Duration coolHold;
+
+  bool _hot = false;
+  DateTime? _coolSince;
+
+  bool get hot => _hot;
+
+  /// Yeni ölçüm; dönüş: oturum şimdi termal nedenle duraklatılmış olmalı mı. Ölçüm yoksa (null) durum korunur.
+  bool update(int? status, DateTime now) {
+    if (status == null) return _hot;
+    if (status >= pauseAt) {
+      _hot = true;
+      _coolSince = null;
+      return true;
+    }
+    if (!_hot) return false;
+    if (status <= resumeAtMost) {
+      _coolSince ??= now;
+      if (now.difference(_coolSince!) >= coolHold) {
+        _hot = false;
+        _coolSince = null;
+        return false;
+      }
+    } else {
+      _coolSince = null;
+    }
+    return true;
+  }
+}
+
+/// Termal durumu düzenli okuyup [DevPauseGate]'e [DevPauseReason.termal] ekler/kaldırır.
+/// Üretimde `thermalStatus: DeviceThermal.status` verilir (kanal yoksa null döner: hiçbir şey yapılmaz).
+class DevResilienceMonitor {
+  DevResilienceMonitor({
+    required this.gate,
+    this.thermalStatus,
+    DevThermalPolicy? policy,
+    this.pollEvery = const Duration(seconds: 30),
+    DateTime Function()? now,
+  })  : policy = policy ?? DevThermalPolicy(),
+        _now = now ?? DateTime.now;
+
+  final DevPauseGate gate;
+  final Future<int?> Function()? thermalStatus;
+  final DevThermalPolicy policy;
+  final Duration pollEvery;
+  final DateTime Function() _now;
+  Timer? _timer;
+
+  void start() {
+    _timer ??= Timer.periodic(pollEvery, (_) => unawaited(tick()));
+  }
+
+  /// Tek ölçüm (testler doğrudan çağırır).
+  Future<void> tick() async {
+    final f = thermalStatus;
+    if (f == null) return;
+    int? s;
+    try {
+      s = await f();
+    } catch (_) {
+      s = null;
+    }
+    final shouldPause = policy.update(s, _now());
+    if (shouldPause) {
+      gate.pause(DevPauseReason.termal);
+    } else {
+      gate.resume(DevPauseReason.termal);
+    }
+  }
+
+  void dispose() {
+    _timer?.cancel();
+    _timer = null;
+  }
+}
+
+/// Ön plan servisi zaman aşımı olayını duraklatmaya bağlar (Android 15 dataSync/shortService vb.).
+/// Servis kapanınca motor çökmez: bir sonraki kapıda duraklar, kontrol noktası yazılır.
+StreamSubscription<KeepAliveEvent> bindServiceTimeout({
+  required Stream<KeepAliveEvent> events,
+  required DevPauseGate gate,
+  void Function(KeepAliveEvent e)? onTimeout,
+}) =>
+    events.listen(
+      (e) {
+        if (e.kind != KeepAliveEventKind.timeout) return;
+        gate.pause(DevPauseReason.servisZamanAsimi);
+        try {
+          onTimeout?.call(e);
+        } catch (_) {}
+      },
+      onError: (Object _) {},
+    );
+
 
 // ====================================================================== üretim bağdaştırıcıları
 
@@ -227,7 +634,26 @@ class DevSessionConfig {
     this.infraWaitingAfter = const Duration(minutes: 30),
     this.maxWait = const Duration(minutes: 15),
     this.openPullRequest = false,
+    this.networkBackoffStart = const Duration(seconds: 5),
+    this.networkBackoffMax = const Duration(minutes: 5),
+    this.networkWaitingAfter = const Duration(minutes: 2),
+    this.networkProbeEvery = const Duration(seconds: 15),
+    this.maxSnapshotChars = 64 * 1024 * 1024,
   });
+
+  /// Kayıtlı kontrol noktasından (süreç ölümü sonrası) yapılandırma kurar. Süre ve commit sınırı sayaçlarda
+  /// (`cfgSureDk`, `cfgMaxCommit`), hedef `models['hedef']` içinde saklanır; diğer sınırlar varsayılandır.
+  factory DevSessionConfig.fromCheckpoint(DevSessionState s) {
+    final min = s.counters['cfgSureDk'] ?? 0;
+    final commits = s.counters['cfgMaxCommit'] ?? 0;
+    return DevSessionConfig(
+      repo: s.repo,
+      baseBranch: s.baseBranch.isEmpty ? 'main' : s.baseBranch,
+      goal: s.models['hedef'] ?? '',
+      maxDuration: min > 0 ? Duration(minutes: min) : const Duration(hours: 24),
+      maxCommits: commits > 0 ? commits : 200,
+    );
+  }
 
   /// `sahip/depo` (olaylarda ve kontrol noktasında görünür).
   final String repo;
@@ -268,6 +694,19 @@ class DevSessionConfig {
   /// Bitişte (kararlı/süre/commit sınırı) taslak PR açılsın mı? Asla birleştirilmez.
   final bool openPullRequest;
 
+  /// Ağ kesintisinde ilk bekleme ve tavanı (üstel; tavanlı). Başarısızlık sayılmaz.
+  final Duration networkBackoffStart;
+  final Duration networkBackoffMax;
+
+  /// Kesinti bu kadar sürerse oturum "bekliyor" durumuna geçer (olay + kontrol noktası).
+  final Duration networkWaitingAfter;
+
+  /// Bekleme sırasında ağın dönüp dönmediğine bakma aralığı.
+  final Duration networkProbeEvery;
+
+  /// Bellekteki depo metninin (karakter) uyarı eşiği; aşılırsa olay yazılır (dosyalar atılmaz).
+  final int maxSnapshotChars;
+
   /// Yalnızca depo/dal/hedef alanlarını değiştirilmiş kopya (diğer sınırlar aynen korunur).
   DevSessionConfig copyWith({String? repo, String? baseBranch, String? goal}) => DevSessionConfig(
         repo: repo ?? this.repo,
@@ -287,6 +726,11 @@ class DevSessionConfig {
         infraWaitingAfter: infraWaitingAfter,
         maxWait: maxWait,
         openPullRequest: openPullRequest,
+        networkBackoffStart: networkBackoffStart,
+        networkBackoffMax: networkBackoffMax,
+        networkWaitingAfter: networkWaitingAfter,
+        networkProbeEvery: networkProbeEvery,
+        maxSnapshotChars: maxSnapshotChars,
       );
 }
 
@@ -349,7 +793,12 @@ class DevSessionEngine {
     CancelToken? cancelToken,
     DateTime Function()? now,
     DevSleep? sleep,
+    DevPauseGate? gate,
+    this.quota,
+    DevNetProbe? netProbe,
   })  : cancelToken = cancelToken ?? CancelToken(),
+        gate = gate ?? DevPauseGate(),
+        _probe = netProbe ?? devNetworkReachable,
         _now = now ?? DateTime.now,
         _sleep = sleep ?? ((d, ct) => ct.wait(d));
 
@@ -366,8 +815,26 @@ class DevSessionEngine {
   final DateTime Function() _now;
   final DevSleep _sleep;
 
+  /// Duraklatma kapısı (kullanıcı, servis zaman aşımı, termal). Dışarıdan paylaşılabilir.
+  final DevPauseGate gate;
+
+  /// GitHub kota bütçesi (isteğe bağlı). Aynı örnek `DevRepoClient`/`GithubCiRunner` göndericisine `wrap` ile verilmelidir.
+  final DevQuotaBudget? quota;
+  final DevNetProbe _probe;
+
   /// İptal: her bekleme ve ağ çağrısı hızlı döner. İdempotent.
-  void cancel() => cancelToken.cancel();
+  void cancel() {
+    cancelToken.cancel();
+    gate.wake(); // duraklamada bekleyen motor iptali fark etsin
+  }
+
+  /// Duraklatır (idempotent). Süren çağrı bitince bir sonraki kapıda durur; kontrol noktası hemen yazılır.
+  bool pause([DevPauseReason reason = DevPauseReason.kullanici]) => gate.pause(reason);
+
+  /// Verilen nedeni kaldırır; başka neden kalmadıysa oturum sürer.
+  bool resume([DevPauseReason reason = DevPauseReason.kullanici]) => gate.resume(reason);
+
+  bool get paused => gate.paused;
 
   // ---- çalışma durumu
   bool _running = false;
@@ -394,6 +861,10 @@ class DevSessionEngine {
   late DateTime _deadline;
   late DateTime _lastBeat;
   String _goal = '';
+  DateTime? _netOutageAt;
+  bool _netWaiting = false;
+  DevQuotaLevel _lastQuotaLevel = DevQuotaLevel.normal;
+  bool _memWarned = false;
 
   /// Sayaçların anlık kopyası (arayüz/test).
   Map<String, int> get counters => Map<String, int>.unmodifiable(_c);
@@ -411,6 +882,7 @@ class DevSessionEngine {
   Future<DevSessionResult> run({DevSessionState? resumeFrom}) async {
     if (_running) throw StateError('Oturum zaten çalışıyor.');
     _running = true;
+    gate.addListener(_onGateChange);
     try {
       return await _runInner(resumeFrom);
     } on _StopSession catch (s) {
@@ -426,6 +898,7 @@ class DevSessionEngine {
       return _safeFinish(DevSessionStatus.hata, DevStopReason.hata, 'Oturum hatayla durdu: ${_safe('$e', 400)}');
     } finally {
       _running = false;
+      gate.removeListener(_onGateChange);
       try {
         await store.flush();
         await ledger.flush();
@@ -452,6 +925,16 @@ class DevSessionEngine {
     _startedAt = saved?.startedAt ?? _now();
     _deadline = _startedAt.add(config.maxDuration);
     _lastBeat = _now();
+    var downtime = Duration.zero;
+    if (saved != null) {
+      // Süreç kesintisi (telefon kapandı/uygulama öldürüldü) oturum süresinden sayılmaz.
+      downtime = _now().difference(saved.updatedAt);
+      if (downtime > Duration.zero) {
+        _deadline = _deadline.add(downtime);
+      } else {
+        downtime = Duration.zero;
+      }
+    }
     _base = (saved != null && saved.baseBranch.isNotEmpty) ? saved.baseBranch : config.baseBranch;
     _goal = config.goal.trim();
     if (saved != null) {
@@ -463,15 +946,27 @@ class DevSessionEngine {
       _models.remove('sonYesil');
       if (_goal.isEmpty) _goal = saved.models['hedef'] ?? '';
     }
+    // Süreç ölümünden sonra yapılandırmayı kontrol noktasından kurabilmek için sınırlar sayaç olarak saklanır.
+    _c['cfgSureDk'] = config.maxDuration.inMinutes;
+    _c['cfgMaxCommit'] = config.maxCommits;
     if (_goal.isNotEmpty) _models['hedef'] = _goal.length > 150 ? _goal.substring(0, 150) : _goal;
     _improving = _n('gelistirme') == 1 && _goal.isNotEmpty;
     _conv = AutopilotConvergence(stablePasses: _n('kararli'));
 
     _phase = 'Hazırlık';
-    _say(DevEventKind.asama, saved == null ? 'Oturum başlıyor: ${config.repo}' : 'Oturum devam ediyor: ${config.repo}');
-    final wb = await repo.createWorkBranch(
-      _base,
-      name: (saved != null && saved.branch.isNotEmpty) ? saved.branch : null,
+    _say(
+      DevEventKind.asama,
+      saved == null
+          ? 'Oturum başlıyor: ${config.repo}'
+          : 'Oturum devam ediyor: ${config.repo}'
+              '${downtime > Duration.zero ? ' (süreç kesintisi ${autopilotDurationText(downtime)}; süreden sayılmadı)' : ''}',
+    );
+    final wb = await _net(
+      'dal açma',
+      () => repo.createWorkBranch(
+        _base,
+        name: (saved != null && saved.branch.isNotEmpty) ? saved.branch : null,
+      ),
     );
     _check();
     _branch = wb.name;
@@ -486,6 +981,8 @@ class DevSessionEngine {
     var needCi = true; // başlangıç taban çizgisi: mevcut ucun yeşil olduğu kanıtlanmalı
     while (true) {
       _check();
+      await _pauseGate();
+      _quotaWatch();
       final stop = _limitStop();
       if (stop != null) throw stop;
       await _beat();
@@ -644,6 +1141,7 @@ class DevSessionEngine {
     CiFailure? pending;
     while (true) {
       _check();
+      await _pauseGate();
       _limitCheck();
       final CiOutcome out;
       if (pending != null) {
@@ -651,7 +1149,7 @@ class DevSessionEngine {
         pending = null;
       } else {
         _phase = 'Actions';
-        out = await ci.checkBranch(_branch, status: _ciStatus);
+        out = await _net('Actions', () => ci.checkBranch(_branch, status: _ciStatus));
         _check();
       }
 
@@ -701,6 +1199,7 @@ class DevSessionEngine {
         final key = 'imza:$sid';
         final seen = _n(key) + 1;
         _c[key] = seen;
+        _capSigCounters();
         if (!_sigs.contains(sid)) _sigs.add(sid);
         if (_sigs.length > 20) _sigs.removeAt(0);
         if (fixPending) {
@@ -811,10 +1310,10 @@ class DevSessionEngine {
     final msg = 'kripton: son yeşil commit\'e geri dönüş ($why)';
     if (_head != _lastGreen) {
       try {
-        _head = await repo.revertTo(_branch, _lastGreen, msg, expectedHeadSha: _head);
+        _head = await _net('geri alma', () => repo.revertTo(_branch, _lastGreen, msg, expectedHeadSha: _head));
       } on DevConflictException {
         await _reload();
-        if (_head != _lastGreen) _head = await repo.revertTo(_branch, _lastGreen, msg, expectedHeadSha: _head);
+        if (_head != _lastGreen) _head = await _net('geri alma', () => repo.revertTo(_branch, _lastGreen, msg, expectedHeadSha: _head));
       }
     }
     await _reload();
@@ -852,6 +1351,7 @@ class DevSessionEngine {
   }) async {
     for (var attempt = 1; attempt <= config.maxPartRetries + 1; attempt++) {
       _check();
+      await _pauseGate();
       _limitCheck();
       _phase = 'Düzeltme ($attempt)';
       final _Reply fx;
@@ -915,6 +1415,7 @@ class DevSessionEngine {
         );
         continue;
       }
+      await _pauseGate(); // duraklatma istendiyse commit'ten ÖNCE dur (yama doğrulandı, hiçbir şey kaybolmaz)
       await ledger.recordSuccess(modelId: fx.modelId);
       return _commit(v, label, fx.modelId);
     }
@@ -932,7 +1433,7 @@ class DevSessionEngine {
     final msg = 'kripton: ${_safe(label, 160)}\n\nDosyalar: ${v.changedPaths.join(', ')}';
     final String sha;
     try {
-      sha = await repo.commitChanges(_branch, _head, changes, msg);
+      sha = await _net('commit', () => repo.commitChanges(_branch, _head, changes, msg));
     } on DevConflictException {
       _inc('cakisma');
       _say(DevEventKind.commit, 'Dal ucu oynadı (çakışma); anlık görüntü yeniden yükleniyor.', level: DevEventLevel.uyari);
@@ -975,9 +1476,12 @@ class DevSessionEngine {
   }) async {
     var errors = 0;
     var none = 0;
+    var netTries = 0;
     while (true) {
       _check();
+      await _pauseGate();
       _limitCheck();
+      _quotaWatch();
       await _beat();
       final pk = pool.pick(role, differFrom: differFrom);
       if (pk.status == PoolPickStatus.wait) {
@@ -1018,6 +1522,7 @@ class DevSessionEngine {
           continue;
         }
         pool.report(PoolReport.success(m.id));
+        if (_netOutageAt != null) await _netRecovered();
         return _Reply(m.id, raw);
       } on CancelledException {
         rethrow;
@@ -1025,12 +1530,23 @@ class DevSessionEngine {
         rethrow;
       } on DevModelCallException catch (e) {
         pool.report(e.report);
+        if (e.report.kind == PoolOutcomeKind.network ||
+            (e.report.kind == PoolOutcomeKind.timeout && !await _probe())) {
+          // Ağ kopuk: model hatası SAYILMAZ; bekle ve yeniden dene.
+          await _netOutage('model', e, ++netTries);
+          continue;
+        }
         errors++;
         _say(DevEventKind.analiz, 'Model hatası: ${_safe('$e', 300)}', level: DevEventLevel.uyari, modelId: m.id);
         if (errors >= config.maxModelAttempts) throw _ModelUnavailable('model çağrıları başarısız (${e.report.kind.name})');
       } catch (e) {
         if (cancelToken.cancelled) throw const CancelledException();
-        pool.report(PoolReport.fromError(m.id, e));
+        final rep = PoolReport.fromError(m.id, e);
+        pool.report(rep);
+        if (rep.kind == PoolOutcomeKind.network || (rep.kind == PoolOutcomeKind.timeout && !await _probe())) {
+          await _netOutage('model', e, ++netTries);
+          continue;
+        }
         errors++;
         _say(DevEventKind.analiz, 'Model hatası: ${_safe('$e', 300)}', level: DevEventLevel.uyari, modelId: m.id);
         if (errors >= config.maxModelAttempts) throw _ModelUnavailable('model çağrıları başarısız');
@@ -1077,6 +1593,7 @@ class DevSessionEngine {
       await _sleep(slice, cancelToken);
       left -= slice;
       _check();
+      await _pauseGate();
       await _beat();
       _limitCheck();
     }
@@ -1088,24 +1605,33 @@ class DevSessionEngine {
     _lastBeat = t;
     _say(
       DevEventKind.kalpAtisi,
-      'Oturum canlı: $_phase (commit ${_n('commit')}, ret ${_n('ret')}, geri alma ${_n('geriAlma')}).',
+      'Oturum canlı: $_phase (commit ${_n('commit')}, ret ${_n('ret')}, geri alma ${_n('geriAlma')}'
+      '${quota == null ? '' : ', GitHub isteği/sa ${quota!.usedLastHour}'}).',
     );
     await _save(_waitingState ? DevSessionStatus.bekliyor : DevSessionStatus.calisiyor);
   }
 
   Future<void> _reload() async {
-    final r = await repo.loadSnapshotWithInfo(_branch);
+    final r = await _net('depo okuma', () => repo.loadSnapshotWithInfo(_branch));
     _check();
     _snap = r.snapshot;
     _head = r.headSha;
+    _checkSnapshotBudget();
   }
 
   Future<void> _save(DevSessionStatus status, {String note = ''}) async {
+    // Duraklatma etkinken "çalışıyor" yazılmaz: süreç şu an öldürülse bile açılışta doğru durum görünür.
+    var eff = status;
+    var effNote = note;
+    if (gate.paused && (status == DevSessionStatus.calisiyor || status == DevSessionStatus.bekliyor)) {
+      eff = DevSessionStatus.duraklatildi;
+      if (effNote.isEmpty) effNote = 'Duraklatıldı: ${gate.reasons.map((r) => r.label).join('; ')}';
+    }
     final models = <String, String>{..._models};
     if (_lastGreen.isNotEmpty) models['sonYesil'] = _lastGreen;
     await store.saveCheckpoint(DevSessionState(
       id: store.id,
-      status: status,
+      status: eff,
       repo: config.repo,
       branch: _branch,
       baseBranch: _base,
@@ -1117,8 +1643,186 @@ class DevSessionEngine {
       lastSignatures: _sigs,
       models: models,
       phase: _phase,
-      note: note,
+      note: effNote,
     ));
+  }
+
+  // ------------------------------------------------------------------ Görev 9/19: dayanıklılık yardımcıları
+
+  /// Kontrol noktasını yazar; hata fırlatmaz (dal henüz açılmadıysa yazmaz: eski iyi kayıt bozulmasın).
+  Future<void> _saveSafe(DevSessionStatus st, {String note = ''}) async {
+    if (_branch.isEmpty) return;
+    try {
+      await _save(st, note: note);
+    } catch (_) {}
+  }
+
+  /// Kapı dinleyicisi: duraklatma istenince olay + HEMEN kontrol noktası (süren çağrı bitmeden de yazılır).
+  void _onGateChange(Set<DevPauseReason> reasons) {
+    if (!_running) return;
+    if (reasons.isEmpty) {
+      _say(DevEventKind.durum, 'Duraklatma kalktı; oturum sürüyor.');
+      return;
+    }
+    _inc('duraklat');
+    final text = reasons.map((r) => r.label).join('; ');
+    _say(
+      DevEventKind.durum,
+      'Oturum duraklatılıyor: $text. Süren işlem bitince durur; ilerleme kontrol noktasına yazıldı.',
+      level: DevEventLevel.uyari,
+    );
+    unawaited(_saveSafe(DevSessionStatus.duraklatildi, note: 'Duraklatıldı: $text'));
+  }
+
+  /// Duraklatma etkinse kalkana (ya da iptale) kadar bekler. Beklenen süre oturum süresinden düşülmez.
+  Future<void> _pauseGate() async {
+    if (!gate.paused) return;
+    final t0 = _now();
+    final prevPhase = _phase;
+    _phase = 'Duraklatıldı';
+    await _saveSafe(
+      DevSessionStatus.duraklatildi,
+      note: 'Duraklatıldı: ${gate.reasons.map((r) => r.label).join('; ')}',
+    );
+    while (gate.paused) {
+      _check();
+      await gate.waitOpen();
+    }
+    _check();
+    final held = _now().difference(t0);
+    if (held > Duration.zero) _deadline = _deadline.add(held);
+    _phase = prevPhase;
+    await _saveSafe(_waitingState ? DevSessionStatus.bekliyor : DevSessionStatus.calisiyor);
+  }
+
+  /// Ağ/sunucu geçici hatasını BEKLEME sayar: üstel (tavanlı) geri çekilmeyle [op] yeniden denenir.
+  /// Kalıcı hatalar ([isDevNetworkError] false), iptal ve çakışma olduğu gibi yükselir.
+  Future<T> _net<T>(String what, Future<T> Function() op) async {
+    var attempt = 0;
+    while (true) {
+      _check();
+      try {
+        final r = await op();
+        if (_netOutageAt != null) await _netRecovered();
+        return r;
+      } catch (e) {
+        if (cancelToken.cancelled) throw const CancelledException();
+        if (e is CancelledException || e is CiCancelledException || e is _StopSession || !isDevNetworkError(e)) {
+          rethrow;
+        }
+        attempt++;
+        await _netOutage(what, e, attempt);
+      }
+    }
+  }
+
+  Duration _netBackoff(int attempt) {
+    final max = config.networkBackoffMax.inMilliseconds;
+    var ms = config.networkBackoffStart.inMilliseconds;
+    if (ms < 1) ms = 1;
+    for (var i = 1; i < attempt && ms < max; i++) {
+      ms *= 2;
+    }
+    if (ms > max) ms = max;
+    return Duration(milliseconds: ms);
+  }
+
+  Future<void> _netOutage(String what, Object e, int attempt) async {
+    final first = _netOutageAt == null;
+    _netOutageAt ??= _now();
+    if (first) _inc('agKesinti');
+    var d = _netBackoff(attempt);
+    final hint = devRetryAfterOf(e);
+    if (hint != null && hint > d) d = hint > config.maxWait ? config.maxWait : hint;
+    final down = _now().difference(_netOutageAt!);
+    _say(
+      DevEventKind.bekleme,
+      'Ağ/sunucu kesintisi ($what): ${_safe('$e', 240)} — başarısızlık sayılmadı; '
+      '${d.inSeconds} sn sonra yeniden denenecek (kesinti ${autopilotDurationText(down)}).',
+      level: DevEventLevel.uyari,
+    );
+    if (!_netWaiting && down >= config.networkWaitingAfter) {
+      _netWaiting = true;
+      _waitingState = true;
+      await _saveSafe(DevSessionStatus.bekliyor, note: 'Ağ bekleniyor: $what');
+    }
+    await _netWait(d);
+  }
+
+  /// Bekleme; her [DevSessionConfig.networkProbeEvery] ağ yoklanır, dönmüşse erken çıkılır.
+  Future<void> _netWait(Duration d) async {
+    var left = d;
+    var slept = Duration.zero;
+    while (left > Duration.zero) {
+      _check();
+      var slice = left < config.networkProbeEvery ? left : config.networkProbeEvery;
+      if (slice > config.heartbeatEvery) slice = config.heartbeatEvery;
+      await _sleep(slice, cancelToken);
+      left -= slice;
+      slept += slice;
+      _check();
+      await _pauseGate();
+      await _beat();
+      _limitCheck();
+      if (left > Duration.zero && slept >= config.networkBackoffStart && await _probe()) break;
+    }
+  }
+
+  Future<void> _netRecovered() async {
+    final since = _netOutageAt;
+    _netOutageAt = null;
+    final wasWaiting = _netWaiting;
+    _netWaiting = false;
+    final len = since == null ? '' : ' (kesinti ${autopilotDurationText(_now().difference(since))})';
+    _say(DevEventKind.bekleme, 'Bağlantı döndü$len; oturum sürüyor.');
+    if (wasWaiting) {
+      _waitingState = false;
+      await _saveSafe(DevSessionStatus.calisiyor);
+    }
+  }
+
+  /// Kota düzeyi değiştiyse olay yazar (yoklamanın seyrekleştiği/rahatladığı görünür olsun).
+  void _quotaWatch() {
+    final q = quota;
+    if (q == null) return;
+    final lv = q.level;
+    if (lv == _lastQuotaLevel) return;
+    final worse = lv.index > _lastQuotaLevel.index;
+    _lastQuotaLevel = lv;
+    if (worse) _inc('kotaYavas');
+    _say(
+      DevEventKind.bekleme,
+      worse
+          ? 'GitHub kotası azalıyor (${lv.name}; son saatte ${q.usedLastHour} istek): yoklama seyrekleştirildi.'
+          : 'GitHub kota baskısı azaldı (${lv.name}).',
+      level: worse ? DevEventLevel.uyari : DevEventLevel.bilgi,
+    );
+  }
+
+  /// `imza:*` sayaçları en çok 16 tutulur (kontrol noktası 64 anahtarla sınırlı; günlerce çalışmada şişmesin).
+  void _capSigCounters() {
+    final keys = _c.keys.where((k) => k.startsWith('imza:')).toList();
+    for (var i = 0; i < keys.length - 16; i++) {
+      _c.remove(keys[i]);
+    }
+  }
+
+  /// Bellekteki depo metni eşiği aşarsa BİR kez uyarır (dosya atılmaz: kapılar tam içeriğe ihtiyaç duyar).
+  void _checkSnapshotBudget() {
+    if (_memWarned) return;
+    var n = 0;
+    for (final v in _snap.text.values) {
+      n += v.length;
+    }
+    if (n > config.maxSnapshotChars) {
+      _memWarned = true;
+      _say(
+        DevEventKind.durum,
+        'Depo metni bellekte yaklaşık ${n ~/ (1024 * 1024)} milyon karakter; RAM baskısı olabilir. '
+        'Çok büyük/gereksiz dosyaları depodan çıkarmayı düşün.',
+        level: DevEventLevel.uyari,
+      );
+    }
   }
 
   void _say(

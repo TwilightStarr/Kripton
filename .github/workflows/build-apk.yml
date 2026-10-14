@@ -159,7 +159,9 @@ jobs:
           import android.app.ApplicationExitInfo
           import android.content.ComponentCallbacks2
           import android.os.Build
+          import android.os.BatteryManager
           import android.os.Debug
+          import android.os.PowerManager
           import io.flutter.embedding.android.FlutterActivity
           import io.flutter.embedding.engine.FlutterEngine
           import io.flutter.plugin.common.EventChannel
@@ -208,6 +210,35 @@ jobs:
                       when (call.method) {
                           "start" -> result.success(KriptonKeepAliveService.start(this))
                           "stop" -> result.success(KriptonKeepAliveService.stop(this))
+                          "isIgnoringBatteryOptimizations" -> result.success(isIgnoringBatteryOptimizations())
+                          "lastTimeout" -> result.success(KriptonKeepAliveService.lastTimeout(this))
+                          else -> result.notImplemented()
+                      }
+                  }
+
+                  // Servis olayları (started/startFailed/timeout). Aktivite yokken olaylar yutulur; zaman aşımı
+                  // kaydı SharedPreferences'ta kalır ve Dart açılışta lastTimeout ile okur.
+                  EventChannel(messenger, "kripton/keepalive_events").setStreamHandler(
+                      object : EventChannel.StreamHandler {
+                          override fun onListen(arguments: Any?, events: EventChannel.EventSink?) {
+                              KriptonKeepAliveService.listener = { kind, at, fgsType ->
+                                  runOnUiThread {
+                                      events?.success(mapOf("kind" to kind, "at" to at, "fgsType" to fgsType))
+                                  }
+                              }
+                          }
+
+                          override fun onCancel(arguments: Any?) {
+                              KriptonKeepAliveService.listener = null
+                          }
+                      }
+                  )
+
+                  // Termal durum ve şarj (thermal_governor.dart DeviceThermal). API 29 öncesinde termal durum null.
+                  MethodChannel(messenger, "kripton/thermal").setMethodCallHandler { call, result ->
+                      when (call.method) {
+                          "getThermalStatus" -> result.success(thermalStatus())
+                          "isCharging" -> result.success(isCharging())
                           else -> result.notImplemented()
                       }
                   }
@@ -218,6 +249,22 @@ jobs:
                   if (level >= ComponentCallbacks2.TRIM_MEMORY_RUNNING_CRITICAL) {
                       runOnUiThread { memoryEventSink?.success(level) }
                   }
+              }
+
+              private fun isIgnoringBatteryOptimizations(): Boolean {
+                  val pm = getSystemService(PowerManager::class.java) ?: return false
+                  return pm.isIgnoringBatteryOptimizations(packageName)
+              }
+
+              private fun thermalStatus(): Int? {
+                  if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) return null
+                  val pm = getSystemService(PowerManager::class.java) ?: return null
+                  return pm.currentThermalStatus
+              }
+
+              private fun isCharging(): Boolean {
+                  val bm = getSystemService(BatteryManager::class.java) ?: return false
+                  return bm.isCharging
               }
 
               private fun memoryInfo(): Map<String, Any> {
@@ -283,61 +330,173 @@ jobs:
           import android.app.Notification
           import android.app.NotificationChannel
           import android.app.NotificationManager
+          import android.app.PendingIntent
           import android.app.Service
           import android.content.Context
           import android.content.Intent
           import android.content.pm.ServiceInfo
           import android.os.Build
           import android.os.IBinder
+          import androidx.annotation.RequiresApi
 
-          // Yerel LLM üretimi sırasında süreci ön planda tutan dataSync servisi.
-          // Üretim bitince (stop) kapanır. Başlatılamazsa (arka planda izin yok) yalnızca false döner.
+          // Uzun işleri (yerel LLM üretimi, günlerce süren geliştirme oturumu) süreci ön planda tutan servis.
+          // Tür: API 34+ specialUse (zaman aşımı yok), API 29-33 dataSync, daha eskide türsüz.
+          // Android 15+ sistem servisi zaman aşımına uğratırsa onTimeout çağrılır; servis KENDİNİ KAPATIR (aksi hâlde
+          // sistem "did not stop within its timeout" hatasıyla uygulamayı çökertir), zaman aşımı SharedPreferences'a yazılır,
+          // kullanıcıya bildirim gösterilir ve Dart tarafına "timeout" olayı gider (oturum duraklar).
+          // Başlatılamazsa (arka planda izin yok) yalnızca false döner / "startFailed" olayı yayılır.
           class KriptonKeepAliveService : Service() {
               override fun onBind(intent: Intent?): IBinder? = null
 
               override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-                  val nm = getSystemService(NotificationManager::class.java)
-                  if (nm.getNotificationChannel(CHANNEL_ID) == null) {
-                      nm.createNotificationChannel(
-                          NotificationChannel(CHANNEL_ID, "Yapay zekâ üretimi", NotificationManager.IMPORTANCE_LOW)
-                      )
-                  }
+                  ensureChannels(this)
                   val notif = Notification.Builder(this, CHANNEL_ID)
                       .setContentTitle("Kripton")
-                      .setContentText("Yerel model yanıt üretiyor")
+                      .setContentText("Uzun işlem sürüyor; arka planda canlı tutuluyor")
                       .setSmallIcon(android.R.drawable.stat_notify_sync)
                       .setOngoing(true)
                       .build()
-                  if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                      startForeground(NOTIF_ID, notif, ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC)
-                  } else {
-                      startForeground(NOTIF_ID, notif)
+                  try {
+                      when {
+                          Build.VERSION.SDK_INT >= 34 ->
+                              startForeground(NOTIF_ID, notif, ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE)
+                          Build.VERSION.SDK_INT >= 29 ->
+                              startForeground(NOTIF_ID, notif, ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC)
+                          else -> startForeground(NOTIF_ID, notif)
+                      }
+                  } catch (e: Exception) {
+                      running = false
+                      emit("startFailed", 0L, -1)
+                      stopSelf()
+                      return START_NOT_STICKY
                   }
+                  running = true
+                  emit("started", System.currentTimeMillis(), -1)
                   return START_NOT_STICKY
+              }
+
+              // API 34: shortService için tek bağımsız değişkenli sürüm; API 35: (startId, fgsType).
+              @RequiresApi(34)
+              override fun onTimeout(startId: Int) {
+                  handleTimeout(-1)
+              }
+
+              @RequiresApi(35)
+              override fun onTimeout(startId: Int, fgsType: Int) {
+                  handleTimeout(fgsType)
+              }
+
+              private fun handleTimeout(fgsType: Int) {
+                  val now = System.currentTimeMillis()
+                  try {
+                      getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit()
+                          .putLong(KEY_TIMEOUT_AT, now)
+                          .putInt(KEY_TIMEOUT_TYPE, fgsType)
+                          .apply()
+                  } catch (e: Exception) {
+                  }
+                  try {
+                      notifyTimeout(this)
+                  } catch (e: Exception) {
+                  }
+                  emit("timeout", now, fgsType)
+                  running = false
+                  try {
+                      stopForeground(STOP_FOREGROUND_REMOVE)
+                  } catch (e: Exception) {
+                  }
+                  stopSelf()
+              }
+
+              override fun onDestroy() {
+                  running = false
+                  super.onDestroy()
               }
 
               companion object {
                   private const val CHANNEL_ID = "kripton_llm"
+                  private const val ALERT_CHANNEL_ID = "kripton_alert"
                   private const val NOTIF_ID = 4107
+                  private const val ALERT_NOTIF_ID = 4108
+                  const val PREFS = "kripton_keepalive"
+                  const val KEY_TIMEOUT_AT = "timeoutAt"
+                  const val KEY_TIMEOUT_TYPE = "timeoutType"
+
+                  // MainActivity'nin EventChannel dinleyicisi (aktivite yokken null; kayıt yine de SharedPreferences'ta kalır).
+                  @Volatile
+                  var listener: ((String, Long, Int) -> Unit)? = null
+
+                  @Volatile
+                  var running: Boolean = false
+
+                  private fun emit(kind: String, at: Long, fgsType: Int) {
+                      try {
+                          listener?.invoke(kind, at, fgsType)
+                      } catch (e: Exception) {
+                      }
+                  }
+
+                  private fun ensureChannels(ctx: Context) {
+                      val nm = ctx.getSystemService(NotificationManager::class.java) ?: return
+                      if (nm.getNotificationChannel(CHANNEL_ID) == null) {
+                          nm.createNotificationChannel(
+                              NotificationChannel(CHANNEL_ID, "Yapay zekâ üretimi", NotificationManager.IMPORTANCE_LOW)
+                          )
+                      }
+                      if (nm.getNotificationChannel(ALERT_CHANNEL_ID) == null) {
+                          nm.createNotificationChannel(
+                              NotificationChannel(ALERT_CHANNEL_ID, "Oturum uyarıları", NotificationManager.IMPORTANCE_HIGH)
+                          )
+                      }
+                  }
+
+                  private fun notifyTimeout(ctx: Context) {
+                      ensureChannels(ctx)
+                      val nm = ctx.getSystemService(NotificationManager::class.java) ?: return
+                      val launch = ctx.packageManager.getLaunchIntentForPackage(ctx.packageName)
+                      val pi = if (launch == null) null else PendingIntent.getActivity(
+                          ctx, 0, launch, PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
+                      )
+                      val b = Notification.Builder(ctx, ALERT_CHANNEL_ID)
+                          .setContentTitle("Kripton: oturum duraklatıldı")
+                          .setContentText("Sistem arka plan servisini durdurdu. İlerleme kaydedildi; uygulamayı açıp Devam'a dokun.")
+                          .setSmallIcon(android.R.drawable.stat_sys_warning)
+                          .setAutoCancel(true)
+                      if (pi != null) b.setContentIntent(pi)
+                      nm.notify(ALERT_NOTIF_ID, b.build())
+                  }
 
                   fun start(ctx: Context): Boolean = try {
                       ctx.startForegroundService(Intent(ctx, KriptonKeepAliveService::class.java))
                       true
                   } catch (e: Exception) {
+                      emit("startFailed", System.currentTimeMillis(), -1)
                       false
                   }
 
                   fun stop(ctx: Context): Boolean = try {
+                      running = false
                       ctx.stopService(Intent(ctx, KriptonKeepAliveService::class.java))
                       true
                   } catch (e: Exception) {
                       false
                   }
+
+                  // Son zaman aşımı kaydı (yoksa null).
+                  fun lastTimeout(ctx: Context): Map<String, Any?>? {
+                      val p = ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+                      val at = p.getLong(KEY_TIMEOUT_AT, 0L)
+                      if (at <= 0L) return null
+                      return mapOf("at" to at, "fgsType" to p.getInt(KEY_TIMEOUT_TYPE, -1))
+                  }
               }
           }
           KOTLIN
                       sed -i "s/__PKG__/$PKG/" "$DIR/MainActivity.kt" "$DIR/KriptonKeepAliveService.kt"
-                      sed -i 's|</application>|        <service android:name=".KriptonKeepAliveService" android:exported="false" android:foregroundServiceType="dataSync"/>\n    </application>|' android/app/src/main/AndroidManifest.xml
+                      # Servis bildirimi depodaki AndroidManifest.xml'de (specialUse + özellik) yer alır; yalnızca eksikse eklenir.
+                      if ! grep -q KriptonKeepAliveService android/app/src/main/AndroidManifest.xml; then
+                        sed -i 's|</application>|        <service android:name=".KriptonKeepAliveService" android:exported="false" android:foregroundServiceType="dataSync\|specialUse"><property android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE" android:value="Uzun suren yapay zeka oturumu"/></service>\n    </application>|' android/app/src/main/AndroidManifest.xml
+                      fi
                       grep -q KriptonKeepAliveService android/app/src/main/AndroidManifest.xml && echo "servis manifest'e eklendi (pkg=$PKG)"
                     fi
 
